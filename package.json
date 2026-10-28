@@ -1,0 +1,40 @@
+{
+  "name": "hachiue",
+  "version": "0.1.0",
+  "description": "Zero-dependency, mobile-optimized WebGPU inference engine for Bonsai 1 (1-bit Q1_0) and Bonsai 2 (Ternary PTQ1_0 / PQ2_0) GGUF models",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "keywords": [
+    "webgpu",
+    "llm",
+    "bonsai",
+    "1-bit",
+    "ternary",
+    "gguf",
+    "mobile",
+    "browser"
+  ],
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@webgpu/types": "^0.1.50",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

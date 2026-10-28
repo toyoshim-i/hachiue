@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.gguf
+*.bin
+.DS_Store
