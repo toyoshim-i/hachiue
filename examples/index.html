@@ -133,7 +133,39 @@
       align-self: flex-start;
       background: var(--card);
       border: 1px solid var(--line);
+      white-space: normal;
+      max-width: 94%;
     }
+    .md-body > :first-child { margin-top: 0; }
+    .md-body > :last-child { margin-bottom: 0; }
+    .md-body p, .md-body ul, .md-body ol, .md-body pre, .md-body blockquote, .md-body table { margin: 8px 0; }
+    .md-body h3, .md-body h4, .md-body h5 { margin: 12px 0 6px; line-height: 1.3; }
+    .md-body h3 { font-size: 16px; }
+    .md-body h4 { font-size: 14.5px; }
+    .md-body h5 { font-size: 13.5px; }
+    .md-body ul, .md-body ol { padding-left: 22px; }
+    .md-body li { margin: 3px 0; }
+    .md-body code {
+      font: 12.5px/1.6 var(--mono);
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 5px;
+    }
+    .md-body pre {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      overflow-x: auto;
+    }
+    .md-body pre code { background: none; border: 0; padding: 0; white-space: pre; }
+    .md-body blockquote { border-left: 3px solid var(--accent); padding: 2px 12px; color: var(--muted); }
+    .md-body table { border-collapse: collapse; display: block; overflow-x: auto; max-width: 100%; font-variant-numeric: tabular-nums; }
+    .md-body th, .md-body td { border: 1px solid var(--line); padding: 4px 10px; text-align: left; }
+    .md-body th { background: var(--bg); }
+    .md-body a { color: var(--accent); }
+    .md-body hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
     .stats {
       font-family: var(--mono);
       font-size: 11px;
@@ -218,6 +250,109 @@
     let abortCtrl = null
 
     const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`
+
+    // Minimal XSS-safe streaming Markdown renderer (matches bitgpu chat.html)
+    const escHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    const inlineMd = (s) => {
+      const codes = []
+      s = s.replace(/`([^`\n]+)`/g, (_, c) => `\x00${codes.push(c) - 1}\x00`)
+      s = s
+        .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+        .replace(/(^|[\s(])\*(\S(?:[^*\n]*\S)?)\*/g, '$1<i>$2</i>')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+      return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[+i]}</code>`)
+    }
+    const renderMarkdown = (src) => {
+      const lines = escHtml(src).split('\n')
+      let html = ''
+      let i = 0
+      let para = []
+      const flush = () => {
+        if (para.length) {
+          html += `<p>${para.map(inlineMd).join('<br>')}</p>`
+          para = []
+        }
+      }
+      while (i < lines.length) {
+        const l = lines[i]
+        if (/^\s*```/.test(l)) {
+          flush()
+          const buf = []
+          for (i++; i < lines.length && !/^\s*```/.test(lines[i]); ) buf.push(lines[i++])
+          i++
+          html += `<pre><code>${buf.join('\n')}</code></pre>`
+          continue
+        }
+        const h = l.match(/^(#{1,3})\s+(.*)/)
+        if (h) {
+          flush()
+          const n = h[1].length + 2
+          html += `<h${n}>${inlineMd(h[2])}</h${n}>`
+          i++
+          continue
+        }
+        if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) {
+          flush()
+          html += '<hr>'
+          i++
+          continue
+        }
+        if (/^\s*&gt;\s?/.test(l)) {
+          flush()
+          const buf = []
+          while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) buf.push(lines[i++].replace(/^\s*&gt;\s?/, ''))
+          html += `<blockquote>${buf.map(inlineMd).join('<br>')}</blockquote>`
+          continue
+        }
+        if (/^\s*\|.*\|\s*$/.test(l) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] ?? '')) {
+          flush()
+          const cells = (s) =>
+            s
+              .trim()
+              .replace(/^\||\|$/g, '')
+              .split('|')
+              .map((c) => inlineMd(c.trim()))
+          html += `<table><thead><tr>${cells(l).map((c) => `<th>${c}</th>`).join('')}</tr></thead><tbody>`
+          for (i += 2; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); ) {
+            html += `<tr>${cells(lines[i++]).map((c) => `<td>${c}</td>`).join('')}</tr>`
+          }
+          html += '</tbody></table>'
+          continue
+        }
+        if (/^(\s*)([-*+]|\d+[.)])\s+/.test(l)) {
+          flush()
+          const items = []
+          let m
+          while (i < lines.length && (m = lines[i].match(/^(\s*)([-*+]|\d+[.)])\s+(.*)/))) {
+            items.push({ ind: Math.floor(m[1].replace(/\t/g, '  ').length / 2), ord: /\d/.test(m[2]), text: m[3] })
+            i++
+          }
+          const stack = []
+          for (const it of items) {
+            const depth = Math.min(it.ind, stack.length) + 1
+            while (stack.length > depth) html += `</li></${stack.pop()}>`
+            if (stack.length === depth) html += '</li>'
+            while (stack.length < depth) {
+              const tag = it.ord ? 'ol' : 'ul'
+              html += `<${tag}>`
+              stack.push(tag)
+            }
+            html += `<li>${inlineMd(it.text)}`
+          }
+          while (stack.length) html += `</li></${stack.pop()}>`
+          continue
+        }
+        if (!l.trim()) {
+          flush()
+          i++
+          continue
+        }
+        para.push(l)
+        i++
+      }
+      flush()
+      return html
+    }
 
     async function refreshCacheBadges() {
       let cachedCount = 0
@@ -307,12 +442,16 @@
     }
 
     async function sendMessage() {
+      if (busy) {
+        abortCtrl?.abort()
+        return
+      }
       const text = promptInput.value.trim()
-      if (!text || !engine || busy) return
+      if (!text || !engine) return
       busy = true
       abortCtrl = new AbortController()
       promptInput.value = ''
-      sendBtn.disabled = true
+      sendBtn.textContent = 'Stop'
 
       messages.push({ role: 'user', content: text })
       const userDiv = document.createElement('div')
@@ -322,21 +461,27 @@
 
       const asstDiv = document.createElement('div')
       asstDiv.className = 'msg assistant'
-      const contentSpan = document.createElement('span')
+      const contentDiv = document.createElement('div')
+      contentDiv.className = 'md-body'
       const statsDiv = document.createElement('div')
       statsDiv.className = 'stats'
-      asstDiv.appendChild(contentSpan)
+      asstDiv.appendChild(contentDiv)
       asstDiv.appendChild(statsDiv)
       chatBox.appendChild(asstDiv)
       chatBox.scrollTop = chatBox.scrollHeight
 
+      let rawOut = ''
       try {
         const res = await engine.generate(messages, {
-          maxNewTokens: 256,
-          temperature: 0.6,
+          maxNewTokens: 512,
+          temperature: 0.5,
+          topK: 20,
+          minP: 0.05,
+          repetitionPenalty: 1.1,
           signal: abortCtrl.signal,
           onToken: (_id, delta) => {
-            contentSpan.textContent += delta
+            rawOut += delta
+            contentDiv.innerHTML = renderMarkdown(rawOut)
             chatBox.scrollTop = chatBox.scrollHeight
           },
         })
@@ -346,14 +491,16 @@
           (res.stats.reusedCache ? ' · cache reused' : '')
       } catch (err) {
         if (err.name === 'AbortError') {
-          contentSpan.textContent += ' [stopped]'
+          rawOut += ' *[stopped]*'
+          contentDiv.innerHTML = renderMarkdown(rawOut)
         } else {
-          contentSpan.textContent += `\n[Error: ${err.message || err}]`
+          contentDiv.textContent = `${rawOut}\n[Error: ${err.message || err}]`
           console.error(err)
         }
       } finally {
         busy = false
         abortCtrl = null
+        sendBtn.textContent = 'Send'
         sendBtn.disabled = false
         promptInput.focus()
       }
