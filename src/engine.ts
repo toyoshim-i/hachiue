@@ -1040,6 +1040,7 @@ export class HachiueEngine {
         decodeMs,
         prefillTokensPerSec: (toPrefill.length / Math.max(1, prefillMs)) * 1000,
         decodeTokensPerSec: (generatedIds.length / decodeMs) * 1000,
+        reusedCache: prefixMatch > 0,
       },
     }
   }

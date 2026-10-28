@@ -175,12 +175,18 @@
         </optgroup>
       </select>
       <button id="loadBtn" class="primary">Load Model</button>
-      <button id="clearCacheBtn" title="Clear OPFS/IndexedDB cached model chunks">Clear Cache</button>
+      <button id="clearChatBtn" disabled title="Reset conversation history and KV/recurrent cache">Clear Chat</button>
     </div>
   </header>
 
   <div class="status-bar">
-    <div id="statusText">Select a Bonsai 1 or Bonsai 2 model and tap "Load Model".</div>
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
+      <div id="statusText">Select a Bonsai 1 or Bonsai 2 model and tap "Load Model".</div>
+      <div id="storageRow" style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;">
+        <span id="storageUsage"></span>
+        <button id="clearCacheBtn" style="font-size:12px;padding:3px 9px;display:none;" title="Remove downloaded model chunks from OPFS / IndexedDB">Remove downloaded models</button>
+      </div>
+    </div>
     <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
   </div>
 
@@ -196,7 +202,9 @@
 
     const modelSelect = document.getElementById('modelSelect')
     const loadBtn = document.getElementById('loadBtn')
+    const clearChatBtn = document.getElementById('clearChatBtn')
     const clearCacheBtn = document.getElementById('clearCacheBtn')
+    const storageUsage = document.getElementById('storageUsage')
     const statusText = document.getElementById('statusText')
     const progWrap = document.getElementById('progWrap')
     const progBar = document.getElementById('progBar')
@@ -207,26 +215,53 @@
     let engine = null
     let messages = []
     let busy = false
+    let abortCtrl = null
+
+    const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`
 
     async function refreshCacheBadges() {
+      let cachedCount = 0
       for (const opt of modelSelect.options) {
         const cached = await isModelCached(opt.value)
+        if (cached) cachedCount++
         const base = opt.textContent.replace(/ ✓ cached$/, '')
         opt.textContent = cached ? `${base} ✓ cached` : base
+      }
+      let estText = ''
+      try {
+        const est = await navigator.storage?.estimate?.()
+        if (est?.usage) estText = ` (${fmtBytes(est.usage)} used)`
+      } catch {}
+      if (cachedCount > 0) {
+        storageUsage.textContent = `${cachedCount} model${cachedCount > 1 ? 's' : ''} cached${estText}`
+        clearCacheBtn.style.display = 'inline-block'
+      } else {
+        storageUsage.textContent = ''
+        clearCacheBtn.style.display = 'none'
       }
     }
     refreshCacheBadges()
 
+    clearChatBtn.onclick = () => {
+      if (busy && abortCtrl) abortCtrl.abort()
+      messages = []
+      engine?.resetCache()
+      chatBox.innerHTML = ''
+      statusText.textContent = 'Chat cleared — the model forgot the conversation (KV & recurrent cache reset).'
+      promptInput.focus()
+    }
+
     clearCacheBtn.onclick = async () => {
       await clearModelCache()
       await refreshCacheBadges()
-      statusText.textContent = 'Model cache cleared from OPFS / IndexedDB.'
+      statusText.textContent = 'Downloaded models removed from browser cache (OPFS / IndexedDB).'
     }
 
     loadBtn.onclick = async () => {
       const url = modelSelect.value
       loadBtn.disabled = true
       modelSelect.disabled = true
+      clearChatBtn.disabled = true
       progWrap.style.display = 'block'
       progBar.style.width = '0%'
 
@@ -258,6 +293,7 @@
         statusText.textContent = `Ready: ${engine.arch.modelName} (${engine.arch.archName}, ${engine.arch.layers}L, vocab=${engine.arch.vocab})`
         promptInput.disabled = false
         sendBtn.disabled = false
+        clearChatBtn.disabled = false
         promptInput.focus()
         await refreshCacheBadges()
       } catch (err) {
@@ -274,6 +310,7 @@
       const text = promptInput.value.trim()
       if (!text || !engine || busy) return
       busy = true
+      abortCtrl = new AbortController()
       promptInput.value = ''
       sendBtn.disabled = true
 
@@ -297,18 +334,26 @@
         const res = await engine.generate(messages, {
           maxNewTokens: 256,
           temperature: 0.6,
+          signal: abortCtrl.signal,
           onToken: (_id, delta) => {
             contentSpan.textContent += delta
             chatBox.scrollTop = chatBox.scrollHeight
           },
         })
         messages.push({ role: 'assistant', content: res.text })
-        statsDiv.textContent = `${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)`
+        statsDiv.textContent =
+          `${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
+          (res.stats.reusedCache ? ' · cache reused' : '')
       } catch (err) {
-        contentSpan.textContent += `\n[Error: ${err.message || err}]`
-        console.error(err)
+        if (err.name === 'AbortError') {
+          contentSpan.textContent += ' [stopped]'
+        } else {
+          contentSpan.textContent += `\n[Error: ${err.message || err}]`
+          console.error(err)
+        }
       } finally {
         busy = false
+        abortCtrl = null
         sendBtn.disabled = false
         promptInput.focus()
       }

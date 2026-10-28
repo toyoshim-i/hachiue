@@ -153,6 +153,7 @@ export interface GenerateStats {
   decodeMs: number
   prefillTokensPerSec: number
   decodeTokensPerSec: number
+  reusedCache: boolean
 }
 
 export interface ChatMessage {
