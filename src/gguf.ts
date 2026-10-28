@@ -1,3 +1,4 @@
+import { readCachedRange } from './storage.js'
 import {
   GgmlType,
   type GgufTensorInfo,
@@ -9,6 +10,17 @@ import {
   type StorageOptions,
   type TokenizerData,
 } from './types.js'
+
+let lastHeaderPrefix: { url: string; bytes: Uint8Array } | null = null
+
+export function consumeHeaderPrefix(url: string): Uint8Array | null {
+  if (lastHeaderPrefix && lastHeaderPrefix.url === url) {
+    const bytes = lastHeaderPrefix.bytes
+    lastHeaderPrefix = null
+    return bytes
+  }
+  return null
+}
 
 const GGUF_MAGIC = 0x46554747 // "GGUF" little-endian
 const DEFAULT_ALIGNMENT = 32
@@ -539,18 +551,41 @@ export async function defaultFetchRange(
 }
 
 /**
- * Fetch and parse only the GGUF header from a remote URL via progressive HTTP Range requests.
+ * Fetch and parse only the GGUF header from a remote URL via progressive HTTP Range requests
+ * (or directly from the local OPFS / IndexedDB chunk cache if chunk 0 is already cached).
  */
 export async function fetchGgufHeader(url: string, options: StorageOptions = {}): Promise<ParsedGgufHeader> {
   const fetchRange = options.fetchRange ?? defaultFetchRange
+  const useCache = options.useCache ?? true
   options.onProgress?.({ phase: 'header', message: 'Fetching GGUF header...' })
 
+  const readOrFetch = async (start: number, endInclusive: number): Promise<Uint8Array> => {
+    if (useCache && !options.fetchRange) {
+      const cached = await readCachedRange(url, start, endInclusive)
+      if (cached) return cached
+    }
+    return fetchRange(url, start, endInclusive, options.signal)
+  }
+
   let size = INITIAL_HEADER_FETCH
-  let buf = new Uint8Array(await fetchRange(url, 0, size - 1, options.signal))
+  let fromNetwork = false
+  let firstSlice: Uint8Array | null = null
+  if (useCache && !options.fetchRange) {
+    firstSlice = await readCachedRange(url, 0, size - 1)
+  }
+  if (!firstSlice) {
+    firstSlice = await fetchRange(url, 0, size - 1, options.signal)
+    fromNetwork = true
+  }
+  let buf = new Uint8Array(firstSlice)
 
   for (;;) {
     try {
-      return parseGgufHeaderBytes(buf)
+      const parsed = parseGgufHeaderBytes(buf)
+      if (fromNetwork && useCache) {
+        lastHeaderPrefix = { url, bytes: buf }
+      }
+      return parsed
     } catch (err) {
       if (!(err instanceof HeaderOutOfDataError)) throw err
       if (buf.byteLength < size) {
@@ -560,7 +595,7 @@ export async function fetchGgufHeader(url: string, options: StorageOptions = {})
         throw new Error(`hachiue: GGUF header exceeds ${MAX_HEADER_FETCH} bytes`)
       }
       const nextSize = Math.min(size * 2, MAX_HEADER_FETCH)
-      const ext = await fetchRange(url, buf.byteLength, nextSize - 1, options.signal)
+      const ext = await readOrFetch(buf.byteLength, nextSize - 1)
       const combined = new Uint8Array(buf.byteLength + ext.byteLength)
       combined.set(buf, 0)
       combined.set(ext, buf.byteLength)

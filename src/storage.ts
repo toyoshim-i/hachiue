@@ -1,4 +1,4 @@
-import { defaultFetchRange, fetchGgufHeader } from './gguf.js'
+import { consumeHeaderPrefix, defaultFetchRange, fetchGgufHeader } from './gguf.js'
 import type { ParsedGgufHeader, StorageOptions } from './types.js'
 
 const DEFAULT_CHUNK_BYTES = 16 * 1024 * 1024 // 16 MiB
@@ -120,6 +120,84 @@ async function getOpfsRoot(): Promise<FileSystemDirectoryHandle | null> {
 }
 
 /**
+ * Read a byte range `[start, endInclusive]` from OPFS or IndexedDB cache if all covering chunks are cached.
+ * Returns `null` if any covering chunk is missing from cache.
+ */
+export async function readCachedRange(
+  url: string,
+  start: number,
+  endInclusive: number,
+): Promise<Uint8Array | null> {
+  const key = hashUrl(url)
+  const opfs = await getOpfsRoot()
+  if (opfs) {
+    try {
+      const metaHandle = await opfs.getFileHandle(`${key}.meta.json`)
+      const metaText = await (await metaHandle.getFile()).text()
+      if (metaText) {
+        const meta = JSON.parse(metaText) as CacheMeta
+        const clampedEnd = Math.min(endInclusive, meta.totalSize - 1)
+        if (clampedEnd >= start) {
+          const c0 = Math.floor(start / meta.chunkBytes)
+          const c1 = Math.floor(clampedEnd / meta.chunkBytes)
+          const set = new Set(meta.completedChunks)
+          let allPresent = true
+          for (let c = c0; c <= c1; c++) {
+            if (!set.has(c)) {
+              allPresent = false
+              break
+            }
+          }
+          if (allPresent) {
+            const dataHandle = await opfs.getFileHandle(`${key}.gguf.bin`)
+            const file = await dataHandle.getFile()
+            if (file.size > clampedEnd) {
+              const slice = file.slice(start, clampedEnd + 1)
+              return new Uint8Array(await slice.arrayBuffer())
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall through to IDB check
+    }
+  }
+  try {
+    const db = typeof indexedDB !== 'undefined' ? await openIdb() : null
+    if (!db) return null
+    try {
+      const meta = await idbGet<CacheMeta>(`meta:${key}`, db)
+      if (!meta || meta.completedChunks.length === 0) return null
+      const clampedEnd = Math.min(endInclusive, meta.totalSize - 1)
+      if (clampedEnd < start) return null
+      const c0 = Math.floor(start / meta.chunkBytes)
+      const c1 = Math.floor(clampedEnd / meta.chunkBytes)
+      const set = new Set(meta.completedChunks)
+      for (let c = c0; c <= c1; c++) {
+        if (!set.has(c)) return null
+      }
+      const out = new Uint8Array(clampedEnd - start + 1)
+      let written = 0
+      for (let c = c0; c <= c1; c++) {
+        const chunk = await idbGet<Uint8Array>(`chunk:${key}:${c}`, db)
+        if (!chunk) return null
+        const chunkStart = c * meta.chunkBytes
+        const s0 = Math.max(0, start - chunkStart)
+        const s1 = Math.min(chunk.byteLength, clampedEnd + 1 - chunkStart)
+        const sub = chunk.subarray(s0, s1)
+        out.set(sub, written)
+        written += sub.byteLength
+      }
+      return out
+    } finally {
+      db.close()
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
  * Return the cached byte size of a model URL if completely cached in OPFS or IndexedDB, or 0 otherwise.
  */
 export async function getCachedModelSize(url: string, expectedTotalBytes?: number): Promise<number> {
@@ -216,38 +294,52 @@ export async function streamModelChunks(
 
   if (useCache) {
     opfsDir = await getOpfsRoot()
+    let opfsMeta: CacheMeta | null = null
     if (opfsDir) {
       try {
-        const metaHandle = await opfsDir.getFileHandle(`${key}.meta.json`, { create: true })
+        const metaHandle = await opfsDir.getFileHandle(`${key}.meta.json`)
         const existingText = await (await metaHandle.getFile()).text()
         if (existingText) {
           const parsed = JSON.parse(existingText) as CacheMeta
           if (parsed.totalSize === totalSize && parsed.chunkBytes === chunkBytes) {
-            meta = parsed
+            opfsMeta = parsed
           }
         }
+      } catch {
+        // No existing OPFS meta file yet
+      }
+    }
+
+    let idbMeta: CacheMeta | null = null
+    try {
+      if (typeof indexedDB !== 'undefined') {
+        idbConn = await openIdb()
+        const existing = await idbGet<CacheMeta>(`meta:${key}`, idbConn)
+        if (existing && existing.totalSize === totalSize && existing.chunkBytes === chunkBytes) {
+          idbMeta = existing
+        }
+      }
+    } catch {
+      // Ignore IDB errors
+    }
+
+    if (idbMeta && (!opfsMeta || idbMeta.completedChunks.length > opfsMeta.completedChunks.length)) {
+      // IndexedDB has the fuller cache (e.g. iOS WebKit fell back to IDB on a previous run)
+      meta = idbMeta
+      opfsDir = null
+    } else if (opfsDir) {
+      try {
         const dataHandle = await opfsDir.getFileHandle(`${key}.gguf.bin`, { create: true })
         if (typeof dataHandle.createWritable === 'function') {
           opfsDataFile = await dataHandle.getFile()
+          if (opfsMeta) meta = opfsMeta
         } else {
-          // Safari main-thread FileSystemFileHandle without createWritable -> use IndexedDB chunk fallback
           opfsDir = null
+          if (idbMeta) meta = idbMeta
         }
       } catch {
         opfsDir = null
-      }
-    }
-    if (!opfsDir) {
-      try {
-        if (typeof indexedDB !== 'undefined') {
-          idbConn = await openIdb()
-        }
-        const existing = await idbGet<CacheMeta>(`meta:${key}`, idbConn)
-        if (existing && existing.totalSize === totalSize && existing.chunkBytes === chunkBytes) {
-          meta = existing
-        }
-      } catch {
-        // Ignore IDB errors
+        if (idbMeta) meta = idbMeta
       }
     }
   }
@@ -322,7 +414,8 @@ export async function streamModelChunks(
             data = null
           }
         }
-      } else if (!opfsDir) {
+      }
+      if (!data) {
         try {
           if (!onChunk) {
             if (await idbHasKey(`chunk:${key}:${ci}`, idbConn)) {
@@ -342,14 +435,34 @@ export async function streamModelChunks(
       }
     }
 
+    const headerPrefix = ci === 0 ? consumeHeaderPrefix(url) : null
+
     if (!data) {
       const baseLoaded = Math.max(0, chunkStart - startOffset)
-      data = await fetchRange(url, chunkStart, chunkEndExclusive - 1, options.signal, (bytesInChunk) => {
-        const curLoaded = Math.max(0, chunkStart + bytesInChunk - startOffset)
-        if (curLoaded > baseLoaded) {
-          reportProgress(curLoaded, false)
+      if (headerPrefix && headerPrefix.byteLength > 0 && headerPrefix.byteLength <= expectedLen) {
+        if (headerPrefix.byteLength === expectedLen) {
+          data = headerPrefix
+        } else {
+          const tailStart = headerPrefix.byteLength
+          const tail = await fetchRange(url, tailStart, chunkEndExclusive - 1, options.signal, (bytesInTail) => {
+            const curLoaded = Math.max(0, tailStart + bytesInTail - startOffset)
+            if (curLoaded > baseLoaded) {
+              reportProgress(curLoaded, false)
+            }
+          })
+          const combined = new Uint8Array(expectedLen)
+          combined.set(headerPrefix, 0)
+          combined.set(tail, tailStart)
+          data = combined
         }
-      })
+      } else {
+        data = await fetchRange(url, chunkStart, chunkEndExclusive - 1, options.signal, (bytesInChunk) => {
+          const curLoaded = Math.max(0, chunkStart + bytesInChunk - startOffset)
+          if (curLoaded > baseLoaded) {
+            reportProgress(curLoaded, false)
+          }
+        })
+      }
       if (data.byteLength !== expectedLen) {
         throw new Error(`hachiue: chunk ${ci} returned ${data.byteLength} bytes, expected ${expectedLen}`)
       }
@@ -374,6 +487,8 @@ export async function streamModelChunks(
         return
       } catch {
         if (writable) await writable.close().catch(() => {})
+        await opfsDir.removeEntry(`${key}.gguf.bin`).catch(() => {})
+        await opfsDir.removeEntry(`${key}.meta.json`).catch(() => {})
         opfsDir = null
       }
     }
