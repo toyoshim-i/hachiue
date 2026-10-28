@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>hachiue (鉢植え) — Mobile WebGPU Bonsai 1 & 2 Runtime</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f6f2;
+      --card: #ffffff;
+      --fg: #1c1b18;
+      --muted: #6e6a63;
+      --line: #e4e0d8;
+      --accent: #2d6a4f;
+      --accent-hover: #1b4332;
+      --accent-fg: #ffffff;
+      --user-bg: #e9f5ee;
+      --danger: #c1121f;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121412;
+        --card: #1b1e1b;
+        --fg: #eae8e3;
+        --muted: #98968f;
+        --line: #2d322d;
+        --accent: #52b788;
+        --accent-hover: #74c69d;
+        --accent-fg: #0b1c13;
+        --user-bg: #1e3528;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      height: 100dvh;
+      margin: 0;
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 16px;
+      background: var(--card);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 17px;
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      flex: 1;
+      justify-content: flex-end;
+    }
+    select, button, input {
+      font: inherit;
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--fg);
+    }
+    button.primary {
+      background: var(--accent);
+      color: var(--accent-fg);
+      border-color: transparent;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status-bar {
+      padding: 8px 16px;
+      font-size: 13px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .progress-wrap {
+      width: 100%;
+      height: 6px;
+      background: var(--line);
+      border-radius: 3px;
+      overflow: hidden;
+      display: none;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.15s ease;
+    }
+    main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      max-width: 820px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    .msg {
+      padding: 10px 14px;
+      border-radius: 12px;
+      max-width: 88%;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: var(--user-bg);
+    }
+    .msg.assistant {
+      align-self: flex-start;
+      background: var(--card);
+      border: 1px solid var(--line);
+    }
+    .stats {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 6px;
+    }
+    footer {
+      padding: 12px 16px;
+      background: var(--card);
+      border-top: 1px solid var(--line);
+      display: flex;
+      gap: 8px;
+      max-width: 820px;
+      width: 100%;
+      margin: 0 auto;
+    }
+    footer input { flex: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">🪴 hachiue <span style="font-weight:400;font-size:13px;color:var(--muted)">Mobile WebGPU Bonsai 1 & 2</span></div>
+    <div class="controls">
+      <select id="modelSelect">
+        <optgroup label="Bonsai 1 (Binary 1-bit Q1_0)">
+          <option value="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf">Bonsai 1.7B Q1_0 (237 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf">Bonsai 4B Q1_0 (546 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B-Q1_0.gguf">Bonsai 8B Q1_0 (1,105 MiB)</option>
+        </optgroup>
+        <optgroup label="Bonsai 2 (Ternary 1.58-bit PTQ1_0 / PQ2_0 + FWHT)">
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf">Bonsai 2 2B PTQ1_0 (409 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PQ2_0.gguf">Bonsai 2 2B PQ2_0 (493 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/main/Ternary-Bonsai-2-4B-PTQ1_0.gguf">Bonsai 2 4B PTQ1_0 (906 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/main/Ternary-Bonsai-2-4B-PQ2_0.gguf">Bonsai 2 4B PQ2_0 (1,093 MiB)</option>
+        </optgroup>
+        <optgroup label="Ternary Bonsai 1 (PQ2_0)">
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/main/Ternary-Bonsai-1.7B-PQ2_0.gguf">Ternary Bonsai 1.7B PQ2_0 (442 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf/resolve/main/Ternary-Bonsai-4B-PQ2_0.gguf">Ternary Bonsai 4B PQ2_0 (1,025 MiB)</option>
+        </optgroup>
+      </select>
+      <button id="loadBtn" class="primary">Load Model</button>
+      <button id="clearCacheBtn" title="Clear OPFS/IndexedDB cached model chunks">Clear Cache</button>
+    </div>
+  </header>
+
+  <div class="status-bar">
+    <div id="statusText">Select a Bonsai 1 or Bonsai 2 model and tap "Load Model".</div>
+    <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
+  </div>
+
+  <main id="chatBox"></main>
+
+  <footer>
+    <input id="promptInput" type="text" placeholder="Type a message..." disabled />
+    <button id="sendBtn" class="primary" disabled>Send</button>
+  </footer>
+
+  <script type="module">
+    import { HachiueEngine, clearModelCache, isModelCached } from '../dist/index.js'
+
+    const modelSelect = document.getElementById('modelSelect')
+    const loadBtn = document.getElementById('loadBtn')
+    const clearCacheBtn = document.getElementById('clearCacheBtn')
+    const statusText = document.getElementById('statusText')
+    const progWrap = document.getElementById('progWrap')
+    const progBar = document.getElementById('progBar')
+    const chatBox = document.getElementById('chatBox')
+    const promptInput = document.getElementById('promptInput')
+    const sendBtn = document.getElementById('sendBtn')
+
+    let engine = null
+    let messages = []
+    let busy = false
+
+    async function refreshCacheBadges() {
+      for (const opt of modelSelect.options) {
+        const cached = await isModelCached(opt.value)
+        const base = opt.textContent.replace(/ ✓ cached$/, '')
+        opt.textContent = cached ? `${base} ✓ cached` : base
+      }
+    }
+    refreshCacheBadges()
+
+    clearCacheBtn.onclick = async () => {
+      await clearModelCache()
+      await refreshCacheBadges()
+      statusText.textContent = 'Model cache cleared from OPFS / IndexedDB.'
+    }
+
+    loadBtn.onclick = async () => {
+      const url = modelSelect.value
+      loadBtn.disabled = true
+      modelSelect.disabled = true
+      progWrap.style.display = 'block'
+      progBar.style.width = '0%'
+
+      try {
+        if (engine) {
+          engine.dispose()
+          engine = null
+        }
+        messages = []
+        chatBox.innerHTML = ''
+
+        engine = await HachiueEngine.create({
+          url,
+          maxSeqLen: 2048,
+          onProgress: (p) => {
+            if (p.phase === 'weights' && p.totalBytes) {
+              const pct = ((p.loadedBytes / p.totalBytes) * 100).toFixed(1)
+              const mb = (p.loadedBytes / 1048576).toFixed(0)
+              const totMb = (p.totalBytes / 1048576).toFixed(0)
+              progBar.style.width = `${pct}%`
+              statusText.textContent = `${p.cached ? 'Loading from local cache' : 'Streaming 16MiB Range chunks'}: ${mb} / ${totMb} MiB (${pct}%)`
+            } else if (p.message) {
+              statusText.textContent = p.message
+            }
+          },
+        })
+
+        progWrap.style.display = 'none'
+        statusText.textContent = `Ready: ${engine.arch.modelName} (${engine.arch.archName}, ${engine.arch.layers}L, vocab=${engine.arch.vocab})`
+        promptInput.disabled = false
+        sendBtn.disabled = false
+        promptInput.focus()
+        await refreshCacheBadges()
+      } catch (err) {
+        progWrap.style.display = 'none'
+        statusText.textContent = `Error: ${err.message || err}`
+        console.error(err)
+      } finally {
+        loadBtn.disabled = false
+        modelSelect.disabled = false
+      }
+    }
+
+    async function sendMessage() {
+      const text = promptInput.value.trim()
+      if (!text || !engine || busy) return
+      busy = true
+      promptInput.value = ''
+      sendBtn.disabled = true
+
+      messages.push({ role: 'user', content: text })
+      const userDiv = document.createElement('div')
+      userDiv.className = 'msg user'
+      userDiv.textContent = text
+      chatBox.appendChild(userDiv)
+
+      const asstDiv = document.createElement('div')
+      asstDiv.className = 'msg assistant'
+      const contentSpan = document.createElement('span')
+      const statsDiv = document.createElement('div')
+      statsDiv.className = 'stats'
+      asstDiv.appendChild(contentSpan)
+      asstDiv.appendChild(statsDiv)
+      chatBox.appendChild(asstDiv)
+      chatBox.scrollTop = chatBox.scrollHeight
+
+      try {
+        const res = await engine.generate(messages, {
+          maxNewTokens: 256,
+          temperature: 0.6,
+          onToken: (_id, delta) => {
+            contentSpan.textContent += delta
+            chatBox.scrollTop = chatBox.scrollHeight
+          },
+        })
+        messages.push({ role: 'assistant', content: res.text })
+        statsDiv.textContent = `prefill: ${res.stats.promptTokens} tok (${res.stats.prefillTokensPerSec.toFixed(1)} tok/s) · decode: ${res.stats.generatedTokens} tok (${res.stats.decodeTokensPerSec.toFixed(1)} tok/s)`
+      } catch (err) {
+        contentSpan.textContent += `\n[Error: ${err.message || err}]`
+        console.error(err)
+      } finally {
+        busy = false
+        sendBtn.disabled = false
+        promptInput.focus()
+      }
+    }
+
+    sendBtn.onclick = sendMessage
+    promptInput.onkeydown = (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault()
+        sendMessage()
+      }
+    }
+  </script>
+</body>
+</html>
