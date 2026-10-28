@@ -70,14 +70,24 @@ Bonsai 2 adopts the **Qwen3.5** hybrid-attention backbone (`vocab = 248,320` vs 
 ## Usage
 
 ```ts
-import { HachiueEngine, MODEL_REGISTRY } from './dist/index.js';
+import { HachiueEngine, prefetchModel } from './dist/index.js';
 
 const engine = await HachiueEngine.create({
-  url: MODEL_REGISTRY['bonsai-2-2b-ptq1'].url,
+  url: 'https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf',
   onProgress: (p) => {
-    console.log(`${p.phase}: ${(p.loadedBytes / 1048576).toFixed(1)} MiB`);
+    if (p.totalBytes) console.log(`${p.phase}: ${(p.loadedBytes / 1048576).toFixed(1)} MiB`);
   },
 });
+
+// Optional: prefetch another model into OPFS / IndexedDB in the background while chatting
+prefetchModel(
+  'https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/main/Ternary-Bonsai-2-4B-PQ2_0.gguf',
+  {
+    onProgress: (p) => {
+      if (p.totalBytes) console.log(`Prefetch: ${((p.loadedBytes / p.totalBytes) * 100).toFixed(1)}%`);
+    },
+  },
+);
 
 const result = await engine.generate({
   messages: [

@@ -1,5 +1,5 @@
-import { defaultFetchRange } from './gguf.js'
-import type { StorageOptions } from './types.js'
+import { defaultFetchRange, fetchGgufHeader } from './gguf.js'
+import type { ParsedGgufHeader, StorageOptions } from './types.js'
 
 const DEFAULT_CHUNK_BYTES = 16 * 1024 * 1024 // 16 MiB
 const IDB_NAME = 'hachiue-model-cache-v1'
@@ -49,6 +49,23 @@ async function idbGet<T>(key: string, existingDb?: IDBDatabase | null): Promise<
     req.onsuccess = () => {
       if (!existingDb) db.close()
       resolve(req.result as T | undefined)
+    }
+    req.onerror = () => {
+      if (!existingDb) db.close()
+      reject(req.error)
+    }
+  })
+}
+
+async function idbHasKey(key: string, existingDb?: IDBDatabase | null): Promise<boolean> {
+  if (typeof indexedDB === 'undefined') return false
+  const db = existingDb ?? (await openIdb())
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly')
+    const req = tx.objectStore(IDB_STORE).count(key)
+    req.onsuccess = () => {
+      if (!existingDb) db.close()
+      resolve(req.result > 0)
     }
     req.onerror = () => {
       if (!existingDb) db.close()
@@ -170,7 +187,7 @@ export async function streamModelChunks(
   url: string,
   startOffset: number,
   totalSize: number,
-  onChunk: (chunk: Uint8Array, fileOffset: number) => Promise<void>,
+  onChunk?: ((chunk: Uint8Array, fileOffset: number) => Promise<void>) | null,
   options: StorageOptions = {},
 ): Promise<void> {
   const chunkBytes = options.chunkBytes ?? DEFAULT_CHUNK_BYTES
@@ -293,19 +310,31 @@ export async function streamModelChunks(
 
     if (useCache && completedSet.has(ci)) {
       if (opfsDir && opfsDataFile && opfsDataFile.size >= chunkEndExclusive) {
-        try {
-          const sliceBlob = opfsDataFile.slice(chunkStart, chunkEndExclusive)
-          data = new Uint8Array(await sliceBlob.arrayBuffer())
+        if (!onChunk) {
+          data = new Uint8Array(0)
           fromCache = true
-        } catch {
-          data = null
+        } else {
+          try {
+            const sliceBlob = opfsDataFile.slice(chunkStart, chunkEndExclusive)
+            data = new Uint8Array(await sliceBlob.arrayBuffer())
+            fromCache = true
+          } catch {
+            data = null
+          }
         }
       } else if (!opfsDir) {
         try {
-          const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`, idbConn)
-          if (cachedChunk && cachedChunk.byteLength === expectedLen) {
-            data = cachedChunk
-            fromCache = true
+          if (!onChunk) {
+            if (await idbHasKey(`chunk:${key}:${ci}`, idbConn)) {
+              data = new Uint8Array(0)
+              fromCache = true
+            }
+          } else {
+            const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`, idbConn)
+            if (cachedChunk && cachedChunk.byteLength === expectedLen) {
+              data = cachedChunk
+              fromCache = true
+            }
           }
         } catch {
           data = null
@@ -377,12 +406,16 @@ export async function streamModelChunks(
       nextPromise?.catch(() => {})
 
       const sliceOffset = Math.max(0, startOffset - cur.chunkStart)
-      const sub = sliceOffset > 0 ? cur.data.subarray(sliceOffset) : cur.data
+      const sub = onChunk && sliceOffset > 0 ? cur.data.subarray(sliceOffset) : cur.data
 
       // Overlap local cache write and WebGPU staging upload for chunk (ci)
       await Promise.all([
         cur.fromCache ? Promise.resolve() : persistChunk(ci, cur.chunkStart, cur.data),
-        onChunk(sub, cur.chunkStart + sliceOffset),
+        onChunk
+          ? onChunk(sub, cur.chunkStart + sliceOffset)
+          : cur.fromCache
+            ? Promise.resolve()
+            : new Promise<void>((r) => setTimeout(r, 0)),
       ])
 
       // Release current chunk buffer before moving to (ci + 1)
@@ -396,4 +429,15 @@ export async function streamModelChunks(
       idbConn.close()
     }
   }
+}
+
+/**
+ * Prefetch a GGUF model into the local OPFS / IndexedDB chunk cache in the background
+ * without initializing WebGPU or allocating GPU buffers.
+ * Safe to run concurrently while another `HachiueEngine` instance is actively generating.
+ */
+export async function prefetchModel(url: string, options: StorageOptions = {}): Promise<ParsedGgufHeader> {
+  const header = await fetchGgufHeader(url, options)
+  await streamModelChunks(url, 0, header.totalFileSize, null, { ...options, useCache: true })
+  return header
 }

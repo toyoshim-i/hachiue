@@ -232,6 +232,7 @@
         </optgroup>
       </select>
       <button id="loadBtn" class="primary">Load Model</button>
+      <button id="prefetchBtn" title="Download selected model into browser cache in the background while keeping the current model active">Prefetch</button>
       <button id="clearChatBtn" disabled title="Reset conversation history and KV/recurrent cache">Clear Chat</button>
     </div>
   </header>
@@ -240,6 +241,7 @@
     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
       <div id="statusText">Select a Bonsai 1 or Bonsai 2 model and tap "Load Model".</div>
       <div id="storageRow" style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;">
+        <span id="prefetchStatus" style="color:var(--accent);"></span>
         <span id="storageUsage"></span>
         <button id="clearCacheBtn" style="font-size:12px;padding:3px 9px;display:none;" title="Remove downloaded model chunks from OPFS / IndexedDB">Remove downloaded models</button>
       </div>
@@ -255,12 +257,14 @@
   </footer>
 
   <script type="module">
-    import { HachiueEngine, clearModelCache, getCachedModelSize } from '../dist/index.js'
+    import { HachiueEngine, clearModelCache, getCachedModelSize, prefetchModel } from '../dist/index.js'
 
     const modelSelect = document.getElementById('modelSelect')
     const loadBtn = document.getElementById('loadBtn')
+    const prefetchBtn = document.getElementById('prefetchBtn')
     const clearChatBtn = document.getElementById('clearChatBtn')
     const clearCacheBtn = document.getElementById('clearCacheBtn')
+    const prefetchStatus = document.getElementById('prefetchStatus')
     const storageUsage = document.getElementById('storageUsage')
     const statusText = document.getElementById('statusText')
     const progWrap = document.getElementById('progWrap')
@@ -273,6 +277,9 @@
     let messages = []
     let busy = false
     let abortCtrl = null
+    let prefetchCtrl = null
+    let prefetchPromise = null
+    const cachedUrls = new Set()
 
     const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`
 
@@ -379,14 +386,27 @@
       return html
     }
 
+    function updatePrefetchBtnState() {
+      if (prefetchCtrl) {
+        prefetchBtn.disabled = false
+        prefetchBtn.textContent = 'Cancel Prefetch'
+        return
+      }
+      const isCached = cachedUrls.has(modelSelect.value)
+      prefetchBtn.disabled = isCached || loadBtn.disabled
+      prefetchBtn.textContent = isCached ? 'Cached ✓' : 'Prefetch'
+    }
+
     async function refreshCacheBadges() {
       let cachedCount = 0
       let cachedBytes = 0
+      cachedUrls.clear()
       for (const opt of modelSelect.options) {
         const size = await getCachedModelSize(opt.value)
         if (size > 0) {
           cachedCount++
           cachedBytes += size
+          cachedUrls.add(opt.value)
         }
         const base = opt.textContent.replace(/ ✓ cached$/, '')
         opt.textContent = size > 0 ? `${base} ✓ cached` : base
@@ -398,8 +418,60 @@
         storageUsage.textContent = ''
         clearCacheBtn.style.display = 'none'
       }
+      updatePrefetchBtnState()
     }
     refreshCacheBadges()
+
+    modelSelect.onchange = () => updatePrefetchBtnState()
+
+    prefetchBtn.onclick = async () => {
+      if (prefetchCtrl) {
+        prefetchCtrl.abort()
+        return
+      }
+      const url = modelSelect.value
+      const label = modelSelect.selectedOptions[0]?.textContent?.replace(/ ✓ cached$/, '') || 'model'
+      prefetchCtrl = new AbortController()
+      updatePrefetchBtnState()
+      progWrap.style.display = 'block'
+      progBar.style.width = '0%'
+      prefetchStatus.textContent = `Prefetching ${label}...`
+
+      prefetchPromise = (async () => {
+        try {
+          await prefetchModel(url, {
+            signal: prefetchCtrl.signal,
+            onProgress: (p) => {
+              if (p.phase === 'weights' && p.totalBytes) {
+                const pct = ((p.loadedBytes / p.totalBytes) * 100).toFixed(1)
+                const mb = (p.loadedBytes / 1048576).toFixed(0)
+                const totMb = (p.totalBytes / 1048576).toFixed(0)
+                progBar.style.width = `${pct}%`
+                prefetchStatus.textContent = `Prefetching: ${mb} / ${totMb} MiB (${pct}%)`
+              }
+            },
+          })
+          prefetchStatus.textContent = `Prefetched ${label} ✓`
+          setTimeout(() => {
+            if (!prefetchCtrl && prefetchStatus.textContent.startsWith('Prefetched')) {
+              prefetchStatus.textContent = ''
+            }
+          }, 4000)
+        } catch (err) {
+          if (err?.name === 'AbortError') {
+            prefetchStatus.textContent = 'Prefetch paused (completed chunks saved)'
+          } else {
+            prefetchStatus.textContent = `Prefetch error: ${err.message || err}`
+            console.error(err)
+          }
+        } finally {
+          prefetchCtrl = null
+          prefetchPromise = null
+          progWrap.style.display = 'none'
+          await refreshCacheBadges()
+        }
+      })()
+    }
 
     clearChatBtn.onclick = () => {
       if (busy && abortCtrl) abortCtrl.abort()
@@ -411,14 +483,25 @@
     }
 
     clearCacheBtn.onclick = async () => {
+      if (prefetchCtrl) {
+        prefetchCtrl.abort()
+        await prefetchPromise?.catch(() => {})
+      }
       await clearModelCache()
       await refreshCacheBadges()
+      prefetchStatus.textContent = ''
       statusText.textContent = 'Downloaded models removed from browser cache (OPFS / IndexedDB).'
     }
 
     loadBtn.onclick = async () => {
       const url = modelSelect.value
+      if (prefetchCtrl) {
+        prefetchCtrl.abort()
+        await prefetchPromise?.catch(() => {})
+      }
+      prefetchStatus.textContent = ''
       loadBtn.disabled = true
+      prefetchBtn.disabled = true
       modelSelect.disabled = true
       clearChatBtn.disabled = true
       progWrap.style.display = 'block'
@@ -462,6 +545,7 @@
       } finally {
         loadBtn.disabled = false
         modelSelect.disabled = false
+        updatePrefetchBtnState()
       }
     }
 

@@ -12,7 +12,7 @@ export {
 } from './gguf.js'
 export { SHADERS } from './kernels.js'
 export { type SampleConfig, sampleLogits } from './sampler.js'
-export { clearModelCache, getCachedModelSize, isModelCached, streamModelChunks } from './storage.js'
+export { clearModelCache, getCachedModelSize, isModelCached, prefetchModel, streamModelChunks } from './storage.js'
 export { GgufTokenizer } from './tokenizer.js'
 export type {
   ChatMessage,

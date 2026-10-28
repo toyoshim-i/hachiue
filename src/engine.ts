@@ -1,7 +1,7 @@
 import { fetchGgufHeader, fp16ToFp32 } from './gguf.js'
 import { SHADERS } from './kernels.js'
 import { sampleLogits } from './sampler.js'
-import { streamModelChunks } from './storage.js'
+import { prefetchModel, streamModelChunks } from './storage.js'
 import { GgufTokenizer } from './tokenizer.js'
 import {
   type ChatMessage,
@@ -12,6 +12,7 @@ import {
   type GgufTensorInfo,
   type ModelArch,
   type ParsedGgufHeader,
+  type StorageOptions,
 } from './types.js'
 
 // WebGPU GPUBufferUsage numeric constants (safe to evaluate in Node.js before WebGPU exists)
@@ -362,6 +363,14 @@ export class HachiueEngine {
         this.ssmRecState.set(li, [mkBuf(recStateBytes), mkBuf(recStateBytes)])
       }
     }
+  }
+
+  /**
+   * Prefetch a GGUF model into the local OPFS / IndexedDB chunk cache in the background
+   * without initializing WebGPU or affecting any currently active HachiueEngine instance.
+   */
+  static async prefetch(url: string, options: StorageOptions = {}): Promise<ParsedGgufHeader> {
+    return prefetchModel(url, options)
   }
 
   /**
