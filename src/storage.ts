@@ -181,7 +181,6 @@ export async function streamModelChunks(
 
   let opfsDir: FileSystemDirectoryHandle | null = null
   let opfsDataFile: File | null = null
-  let opfsWritable: FileSystemWritableFileStream | null = null
   let idbConn: IDBDatabase | null = null
   let meta: CacheMeta = {
     url,
@@ -231,7 +230,10 @@ export async function streamModelChunks(
 
   const completedSet = new Set<number>(meta.completedChunks)
 
+  let dirtyMeta = false
   const saveMeta = async (): Promise<void> => {
+    if (!dirtyMeta) return
+    dirtyMeta = false
     meta.completedChunks = Array.from(completedSet)
     meta.updatedAt = Date.now()
     if (opfsDir) {
@@ -248,90 +250,141 @@ export async function streamModelChunks(
     await idbPut(`meta:${key}`, meta, idbConn).catch(() => {})
   }
 
-  try {
-    for (let ci = firstChunkIndex; ci < totalChunks; ci++) {
-      if (options.signal?.aborted) {
-        throw new DOMException('Model loading aborted', 'AbortError')
-      }
-      const chunkStart = ci * chunkBytes
-      const chunkEndExclusive = Math.min(totalSize, chunkStart + chunkBytes)
-      const expectedLen = chunkEndExclusive - chunkStart
+  interface AcquiredChunk {
+    ci: number
+    chunkStart: number
+    chunkEndExclusive: number
+    data: Uint8Array
+    fromCache: boolean
+  }
 
-      let data: Uint8Array | null = null
-      let fromCache = false
+  // Track highest byte position reported so out-of-order/pipelined progress never moves backward
+  let maxReportedLoaded = 0
+  const totalPayloadBytes = totalSize - startOffset
+  const reportProgress = (loaded: number, cached: boolean): void => {
+    if (loaded > maxReportedLoaded) {
+      maxReportedLoaded = loaded
+    }
+    options.onProgress?.({
+      phase: 'weights',
+      loadedBytes: Math.min(maxReportedLoaded, totalPayloadBytes),
+      totalBytes: totalPayloadBytes,
+      cached,
+    })
+  }
 
-      if (useCache && completedSet.has(ci)) {
-        if (opfsDir && opfsDataFile && opfsDataFile.size >= chunkEndExclusive) {
-          try {
-            const sliceBlob = opfsDataFile.slice(chunkStart, chunkEndExclusive)
-            data = new Uint8Array(await sliceBlob.arrayBuffer())
+  const acquireChunk = async (ci: number): Promise<AcquiredChunk> => {
+    if (options.signal?.aborted) {
+      throw new DOMException('Model loading aborted', 'AbortError')
+    }
+    const chunkStart = ci * chunkBytes
+    const chunkEndExclusive = Math.min(totalSize, chunkStart + chunkBytes)
+    const expectedLen = chunkEndExclusive - chunkStart
+
+    let data: Uint8Array | null = null
+    let fromCache = false
+
+    if (useCache && completedSet.has(ci)) {
+      if (opfsDir && opfsDataFile && opfsDataFile.size >= chunkEndExclusive) {
+        try {
+          const sliceBlob = opfsDataFile.slice(chunkStart, chunkEndExclusive)
+          data = new Uint8Array(await sliceBlob.arrayBuffer())
+          fromCache = true
+        } catch {
+          data = null
+        }
+      } else if (!opfsDir) {
+        try {
+          const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`, idbConn)
+          if (cachedChunk && cachedChunk.byteLength === expectedLen) {
+            data = cachedChunk
             fromCache = true
-          } catch {
-            data = null
           }
-        } else if (!opfsDir) {
-          try {
-            const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`, idbConn)
-            if (cachedChunk && cachedChunk.byteLength === expectedLen) {
-              data = cachedChunk
-              fromCache = true
-            }
-          } catch {
-            data = null
-          }
+        } catch {
+          data = null
         }
       }
+    }
 
-      if (!data) {
-        data = await fetchRange(url, chunkStart, chunkEndExclusive - 1, options.signal)
-        if (data.byteLength !== expectedLen) {
-          throw new Error(`hachiue: chunk ${ci} returned ${data.byteLength} bytes, expected ${expectedLen}`)
+    if (!data) {
+      const baseLoaded = Math.max(0, chunkStart - startOffset)
+      data = await fetchRange(url, chunkStart, chunkEndExclusive - 1, options.signal, (bytesInChunk) => {
+        const curLoaded = Math.max(0, chunkStart + bytesInChunk - startOffset)
+        if (curLoaded > baseLoaded) {
+          reportProgress(curLoaded, false)
         }
-        if (useCache) {
-          if (opfsDir) {
-            try {
-              const dataHandle = await opfsDir.getFileHandle(`${key}.gguf.bin`, { create: true })
-              opfsWritable = await dataHandle.createWritable({ keepExistingData: true })
-              await opfsWritable.write({ type: 'write', position: chunkStart, data: data as Uint8Array<ArrayBuffer> })
-              await opfsWritable.close()
-              opfsWritable = null
-              completedSet.add(ci)
-              await saveMeta()
-            } catch {
-              opfsDir = null
-            }
-          }
-          if (!opfsDir) {
-            try {
-              if (!idbConn && typeof indexedDB !== 'undefined') {
-                idbConn = await openIdb()
-              }
-              await idbPut(`chunk:${key}:${ci}`, data, idbConn)
-              completedSet.add(ci)
-              await saveMeta()
-            } catch {
-              // Non-fatal if storage quota exceeded
-            }
-          }
-        }
-      }
-
-      const sliceOffset = Math.max(0, startOffset - chunkStart)
-      const sub = sliceOffset > 0 ? data.subarray(sliceOffset) : data
-      await onChunk(sub, chunkStart + sliceOffset)
-      data = null
-
-      options.onProgress?.({
-        phase: 'weights',
-        loadedBytes: chunkEndExclusive - startOffset,
-        totalBytes: totalSize - startOffset,
-        cached: fromCache,
       })
+      if (data.byteLength !== expectedLen) {
+        throw new Error(`hachiue: chunk ${ci} returned ${data.byteLength} bytes, expected ${expectedLen}`)
+      }
+    }
+
+    return { ci, chunkStart, chunkEndExclusive, data, fromCache }
+  }
+
+  const persistChunk = async (ci: number, chunkStart: number, data: Uint8Array): Promise<void> => {
+    if (!useCache) return
+    if (opfsDir) {
+      let writable: FileSystemWritableFileStream | null = null
+      try {
+        const dataHandle = await opfsDir.getFileHandle(`${key}.gguf.bin`, { create: true })
+        writable = await dataHandle.createWritable({ keepExistingData: true })
+        await writable.write({ type: 'write', position: chunkStart, data: data as Uint8Array<ArrayBuffer> })
+        await writable.close()
+        writable = null
+        completedSet.add(ci)
+        dirtyMeta = true
+        if ((ci & 3) === 0 || ci === totalChunks - 1) await saveMeta()
+        return
+      } catch {
+        if (writable) await writable.close().catch(() => {})
+        opfsDir = null
+      }
+    }
+    if (!opfsDir) {
+      try {
+        if (!idbConn && typeof indexedDB !== 'undefined') {
+          idbConn = await openIdb()
+        }
+        await idbPut(`chunk:${key}:${ci}`, data, idbConn)
+        completedSet.add(ci)
+        dirtyMeta = true
+        if ((ci & 3) === 0 || ci === totalChunks - 1) await saveMeta()
+      } catch {
+        // Non-fatal if storage quota exceeded
+      }
+    }
+  }
+
+  try {
+    // Double-buffered pipeline: prefetch chunk (ci + 1) while chunk (ci) persists to OPFS/IDB and uploads to WebGPU.
+    // Peak memory is strictly bounded to at most 2 chunks (32 MiB).
+    let nextPromise: Promise<AcquiredChunk> | null =
+      firstChunkIndex < totalChunks ? acquireChunk(firstChunkIndex) : null
+
+    for (let ci = firstChunkIndex; ci < totalChunks; ci++) {
+      const cur = (await nextPromise)!
+      // Immediately start acquiring chunk (ci + 1) in the second buffer slot
+      nextPromise = ci + 1 < totalChunks ? acquireChunk(ci + 1) : null
+      // Prevent unhandled rejection if cur processing throws before nextPromise is awaited
+      nextPromise?.catch(() => {})
+
+      const sliceOffset = Math.max(0, startOffset - cur.chunkStart)
+      const sub = sliceOffset > 0 ? cur.data.subarray(sliceOffset) : cur.data
+
+      // Overlap local cache write and WebGPU staging upload for chunk (ci)
+      await Promise.all([
+        cur.fromCache ? Promise.resolve() : persistChunk(ci, cur.chunkStart, cur.data),
+        onChunk(sub, cur.chunkStart + sliceOffset),
+      ])
+
+      // Release current chunk buffer before moving to (ci + 1)
+      ;(cur as { data: Uint8Array | null }).data = null
+
+      reportProgress(cur.chunkEndExclusive - startOffset, cur.fromCache)
     }
   } finally {
-    if (opfsWritable) {
-      await opfsWritable.close().catch(() => {})
-    }
+    await saveMeta().catch(() => {})
     if (idbConn) {
       idbConn.close()
     }

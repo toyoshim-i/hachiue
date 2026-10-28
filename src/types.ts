@@ -118,7 +118,13 @@ export interface StorageOptions {
   /** Whether to persist downloaded chunks in OPFS / IndexedDB cache (default: true) */
   useCache?: boolean
   /** Custom fetch implementation or Range fetcher */
-  fetchRange?: (url: string, start: number, endInclusive: number, signal?: AbortSignal) => Promise<Uint8Array>
+  fetchRange?: (
+    url: string,
+    start: number,
+    endInclusive: number,
+    signal?: AbortSignal,
+    onBytes?: (bytesRead: number) => void,
+  ) => Promise<Uint8Array>
   onProgress?: (progress: LoadProgress) => void
   signal?: AbortSignal
 }

@@ -478,6 +478,7 @@ export async function defaultFetchRange(
   start: number,
   endInclusive: number,
   signal?: AbortSignal,
+  onBytes?: (bytesRead: number) => void,
 ): Promise<Uint8Array> {
   const expectedLen = endInclusive - start + 1
   const res = await fetch(url, {
@@ -485,7 +486,30 @@ export async function defaultFetchRange(
     signal,
   })
   if (res.status === 206) {
+    if (res.body && onBytes) {
+      const reader = res.body.getReader()
+      const out = new Uint8Array(expectedLen)
+      let written = 0
+      let lastReport = 0
+      try {
+        while (written < expectedLen) {
+          const { done, value } = await reader.read()
+          if (done) break
+          const take = Math.min(value.byteLength, expectedLen - written)
+          out.set(value.subarray(0, take), written)
+          written += take
+          if (written - lastReport >= 512 * 1024 || written === expectedLen) {
+            lastReport = written
+            onBytes(written)
+          }
+        }
+      } finally {
+        reader.releaseLock()
+      }
+      return written === expectedLen ? out : out.subarray(0, written)
+    }
     const ab = await res.arrayBuffer()
+    onBytes?.(ab.byteLength)
     return new Uint8Array(ab)
   }
   if (res.ok && res.body) {
