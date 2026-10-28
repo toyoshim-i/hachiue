@@ -37,7 +37,9 @@ Zero-dependency, mobile-optimized WebGPU inference engine for **PrismML Bonsai 1
 | **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | Supported |
 | **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | Supported |
 | **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* |
-| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | Supported |
+| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | **26.4 tok/s** *(prefill 478 ms)* |
+
+*Measured on a single-turn `"hello"` prompt (13 prompt tokens).*
 
 ### Published Quality Benchmarks
 
