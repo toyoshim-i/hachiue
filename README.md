@@ -30,10 +30,11 @@ Zero-dependency, mobile-optimized WebGPU inference engine for **PrismML Bonsai 1
 | Model | Base Arch | Format | bpw | File Size | iPhone 17 Pro Max (Chrome) |
 | :--- | :--- | :--- | ---: | ---: | :--- |
 | **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(prefill 187 ms)* |
-| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | Supported |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | Supported |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | Supported |
-| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | Supported |
+| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | **42.0 tok/s** *(prefill 228 ms)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | **25.4 tok/s** *(prefill 417 ms)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | **44.2 tok/s** *(prefill 243 ms)* |
+| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | **30.7 tok/s** *(prefill 339 ms)* |
+| **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | Supported |
 | **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | Supported |
 | **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* |
 | **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | Supported |
