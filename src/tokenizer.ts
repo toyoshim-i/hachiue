@@ -231,7 +231,17 @@ export class GgufTokenizer {
     const think = options.enableThinking ?? false
     let out = ''
     for (const msg of messages) {
-      out += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`
+      if (
+        msg.role === 'assistant' &&
+        !think &&
+        this.tokenToIdMap.has('<think>') &&
+        this.tokenToIdMap.has('</think>') &&
+        !msg.content.startsWith('<think>')
+      ) {
+        out += `<|im_start|>assistant\n<think>\n\n</think>\n\n${msg.content}<|im_end|>\n`
+      } else {
+        out += `<|im_start|>${msg.role}\n${msg.content}<|im_end|>\n`
+      }
     }
     if (addGen) {
       out += `<|im_start|>assistant\n`

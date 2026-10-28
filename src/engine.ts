@@ -248,6 +248,8 @@ export class HachiueEngine {
   private ssmParity = 0
   private cachePos = 0
   private tokenHistory: number[] = []
+  private lastMessages: ChatMessage[] = []
+  private lastTurnTokens: number[] = []
   private disposed = false
 
   private constructor(
@@ -603,6 +605,8 @@ export class HachiueEngine {
     this.cachePos = 0
     this.ssmParity = 0
     this.tokenHistory = []
+    this.lastMessages = []
+    this.lastTurnTokens = []
   }
 
   /**
@@ -1009,6 +1013,7 @@ export class HachiueEngine {
     options: GenerateOptions = {},
   ): Promise<{ text: string; tokenIds: number[]; stats: GenerateStats }> {
     let promptIds: number[]
+    let chatInput: ChatMessage[] | null = null
     if (Array.isArray(promptOrMessages) && typeof promptOrMessages[0] === 'number') {
       promptIds = promptOrMessages as number[]
     } else if (typeof promptOrMessages === 'string') {
@@ -1016,8 +1021,21 @@ export class HachiueEngine {
       promptIds = this.tokenizer.encode(promptOrMessages)
     } else {
       if (!this.tokenizer) throw new Error('hachiue: GGUF header does not contain a tokenizer')
-      const formatted = this.tokenizer.formatChat(promptOrMessages as ChatMessage[])
-      promptIds = this.tokenizer.encode(formatted)
+      chatInput = promptOrMessages as ChatMessage[]
+      const canExtendLastChat =
+        this.lastMessages.length > 0 &&
+        chatInput.length > this.lastMessages.length &&
+        this.lastMessages.every(
+          (m, idx) => chatInput![idx].role === m.role && chatInput![idx].content === m.content,
+        )
+      if (canExtendLastChat) {
+        const deltaMsgs = chatInput.slice(this.lastMessages.length)
+        const formattedDelta = this.tokenizer.formatChat(deltaMsgs)
+        promptIds = [...this.lastTurnTokens, ...this.tokenizer.encode(formattedDelta)]
+      } else {
+        const formatted = this.tokenizer.formatChat(chatInput)
+        promptIds = this.tokenizer.encode(formatted)
+      }
     }
 
     if (promptIds.length === 0) {
@@ -1098,6 +1116,11 @@ export class HachiueEngine {
 
     const decodeMs = Math.max(1, performance.now() - decodeStart)
     const text = this.tokenizer ? this.tokenizer.decode(generatedIds, true) : ''
+
+    if (chatInput && this.tokenizer) {
+      this.lastMessages = [...chatInput.map((m) => ({ ...m })), { role: 'assistant', content: text }]
+      this.lastTurnTokens = [...promptIds, ...generatedIds, ...this.tokenizer.encode('<|im_end|>\n')]
+    }
 
     return {
       text,
