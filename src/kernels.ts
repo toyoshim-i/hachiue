@@ -17,10 +17,10 @@
 export const SHADERS: Record<string, string> = {
   /**
    * Embedding gather for Q1_0, PQ2_0, or PTQ1_0 directly from the shared token_embd buffers.
-   * Params: [H, mode (0=Q1_0, 1=PQ2_0, 2=PTQ1_0), tokenCount, rowOffset]
+   * Params: [H, mode (0=Q1_0, 1=PQ2_0, 2=PTQ1_0), tokenCount, rowOffset, rowCount]
    */
   embed_gather: /* wgsl */ `
-struct Params { H: u32, mode: u32, S: u32, rowOffset: u32 };
+struct Params { H: u32, mode: u32, S: u32, rowOffset: u32, rowCount: u32, _p0: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> tokens: array<u32>;
 @group(0) @binding(2) var<storage, read> quants: array<u32>;
@@ -67,7 +67,9 @@ fn ptqTrit(blockBaseByte: u32, idxInBlock: u32) -> f32 {
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let s = wg.y;
   if (s >= p.S) { return; }
-  let tok = tokens[s] - p.rowOffset;
+  let rawTok = tokens[s];
+  if (rawTok < p.rowOffset || rawTok >= p.rowOffset + p.rowCount) { return; }
+  let tok = rawTok - p.rowOffset;
   let nb = p.H >> 7u;
   for (var k = lid.x; k < p.H; k = k + 256u) {
     let blk = k >> 7u;
@@ -589,26 +591,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         var subSum = 0.0;
 
         let ba = readByte(baseByte + sub);
-        subSum += xa0 * f32(i32(((ba * 1u) & 0xffu) * 3u >> 8u) - 1);
-        subSum += xa1 * f32(i32(((ba * 3u) & 0xffu) * 3u >> 8u) - 1);
-        subSum += xa2 * f32(i32(((ba * 9u) & 0xffu) * 3u >> 8u) - 1);
-        subSum += xa3 * f32(i32(((ba * 27u) & 0xffu) * 3u >> 8u) - 1);
-        subSum += xa4 * f32(i32(((ba * 81u) & 0xffu) * 3u >> 8u) - 1);
+        subSum += xa0 * f32(i32((((ba * 1u) & 0xffu) * 3u) >> 8u) - 1);
+        subSum += xa1 * f32(i32((((ba * 3u) & 0xffu) * 3u) >> 8u) - 1);
+        subSum += xa2 * f32(i32((((ba * 9u) & 0xffu) * 3u) >> 8u) - 1);
+        subSum += xa3 * f32(i32((((ba * 27u) & 0xffu) * 3u) >> 8u) - 1);
+        subSum += xa4 * f32(i32((((ba * 81u) & 0xffu) * 3u) >> 8u) - 1);
 
         if (sub < 8u) {
           let bb = readByte(baseByte + 16u + sub);
-          subSum += xb0 * f32(i32(((bb * 1u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xb1 * f32(i32(((bb * 3u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xb2 * f32(i32(((bb * 9u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xb3 * f32(i32(((bb * 27u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xb4 * f32(i32(((bb * 81u) & 0xffu) * 3u >> 8u) - 1);
+          subSum += xb0 * f32(i32((((bb * 1u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xb1 * f32(i32((((bb * 3u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xb2 * f32(i32((((bb * 9u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xb3 * f32(i32((((bb * 27u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xb4 * f32(i32((((bb * 81u) & 0xffu) * 3u) >> 8u) - 1);
         }
         if (sub < 2u) {
           let bc = readByte(baseByte + 24u + sub);
-          subSum += xc0 * f32(i32(((bc * 1u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xc1 * f32(i32(((bc * 3u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xc2 * f32(i32(((bc * 9u) & 0xffu) * 3u >> 8u) - 1);
-          subSum += xc3 * f32(i32(((bc * 27u) & 0xffu) * 3u >> 8u) - 1);
+          subSum += xc0 * f32(i32((((bc * 1u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xc1 * f32(i32((((bc * 3u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xc2 * f32(i32((((bc * 9u) & 0xffu) * 3u) >> 8u) - 1);
+          subSum += xc3 * f32(i32((((bc * 27u) & 0xffu) * 3u) >> 8u) - 1);
         }
 
         acc[r] = acc[r] + subSum * scale;

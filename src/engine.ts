@@ -313,11 +313,22 @@ export class HachiueEngine {
     await Promise.all(
       Object.entries(SHADERS).map(async ([name, code]) => {
         const mod = device!.createShaderModule({ code, label: name })
-        const pipe = await device!.createComputePipelineAsync({
-          layout: 'auto',
-          compute: { module: mod, entryPoint: 'main' },
-        })
-        pipelines.set(name, pipe)
+        if (typeof mod.getCompilationInfo === 'function') {
+          const info = await mod.getCompilationInfo()
+          const err = info.messages.find((m) => m.type === 'error')
+          if (err) {
+            throw new Error(`hachiue: WGSL error in ${name} (L${err.lineNum}:${err.linePos}): ${err.message}`)
+          }
+        }
+        try {
+          const pipe = await device!.createComputePipelineAsync({
+            layout: 'auto',
+            compute: { module: mod, entryPoint: 'main' },
+          })
+          pipelines.set(name, pipe)
+        } catch (err) {
+          throw new Error(`hachiue: pipeline compile failed in ${name}: ${(err as Error).message || err}`)
+        }
       }),
     )
 
@@ -574,12 +585,8 @@ export class HachiueEngine {
   ): void {
     const w = this.weights.get(weightName)
     if (!w?.f32Buf) throw new Error(`hachiue: missing norm tensor ${weightName}`)
-    const isQwen35UnitNorm =
-      this.arch.archName === 'qwen35' &&
-      (weightName.endsWith('attn_norm.weight') ||
-        weightName.endsWith('post_attention_norm.weight') ||
-        weightName === 'output_norm.weight')
-    const u = this.mkUniform([rows, dim, this.arch.rmsEps, isQwen35UnitNorm ? 1 : 0], new Set([2]))
+    // Note: GGUF converter already bakes (1 + weight) into Qwen3.5 RMSNorm tensors.
+    const u = this.mkUniform([rows, dim, this.arch.rmsEps, 0], new Set([2]))
     tempBufs.push(u)
     this.dispatch(pass, 'rmsnorm', u, [xBuf, w.f32Buf, outBuf], rows)
   }
@@ -681,17 +688,18 @@ export class HachiueEngine {
     const embdW = this.weights.get('token_embd.weight')!
     const embMode = embdW.type === GgmlType.Q1_0 ? 0 : embdW.type === GgmlType.PQ2_0 ? 1 : 2
     let curH = mkAct(S * Hd)
-    const embChunk = embdW.chunks![0]
-    const uEmb = this.mkUniform([Hd, embMode, S, embChunk.rowStart])
-    tempBufs.push(uEmb)
-    this.dispatch(
-      pass,
-      'embed_gather',
-      uEmb,
-      [this.tokensBuf, embChunk.quants, embChunk.scales16, curH],
-      Math.ceil(Hd / 256),
-      S,
-    )
+    for (const embChunk of embdW.chunks!) {
+      const uEmb = this.mkUniform([Hd, embMode, S, embChunk.rowStart, embChunk.rowCount, 0, 0, 0])
+      tempBufs.push(uEmb)
+      this.dispatch(
+        pass,
+        'embed_gather',
+        uEmb,
+        [this.tokensBuf, embChunk.quants, embChunk.scales16, curH],
+        Math.ceil(Hd / 256),
+        S,
+      )
+    }
 
     if (this.arch.hadamard?.inverseWeights.has('token_embd.weight')) {
       const unrotH = mkAct(S * Hd)
