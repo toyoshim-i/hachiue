@@ -10,9 +10,9 @@ Zero-dependency, mobile-optimized WebGPU inference engine for **PrismML Bonsai 1
   - Point `HachiueEngine.create({ url })` directly at any `.gguf` URL on Hugging Face.
   - Includes a zero-dependency GGUF v3 parser and embedded BPE tokenizer extracted straight from the GGUF header.
 - **Double-Buffered Mobile Streaming & Resumable Cache**:
-  - Replaces `Response.clone()` and monolithic `CacheStorage.put()` with bounded **16 MiB HTTP `Range` requests** persisted chunk-by-chunk to **OPFS (Origin Private File System)** (with automatic IndexedDB chunk fallback on iOS Safari).
+  - Replaces `Response.clone()` and monolithic `CacheStorage.put()` with bounded **16 MiB HTTP `Range` requests** persisted chunk-by-chunk to **OPFS (Origin Private File System)** (with automatic IndexedDB chunk fallback on iOS WebKit).
   - Uses a **2-slot double-buffered pipeline** that overlaps downloading chunk `N + 1` with writing chunk `N` to local cache and uploading tensors to WebGPU (peak chunk RAM $\le$ 32 MiB).
-  - Enforces WebGPU queue backpressure (`await device.queue.onSubmittedWorkDone()`) and macrotask GC yields every 16 MiB so iOS Safari Jetsam limits are never exceeded—even when loading 1.1 GB 4B models on an iPhone.
+  - Enforces WebGPU queue backpressure (`await device.queue.onSubmittedWorkDone()`) and macrotask GC yields every 16 MiB so iOS Jetsam limits are never exceeded—even when loading 1.1 GB 4B models on an iPhone.
 - **Zero-Inflation Planar VRAM Layout & Zero-Allocation Runtime**:
   - Keeps `Q1_0` (18B / 128 weights), `PTQ1_0` (28B / 128 weights), and `PQ2_0` (34B / 128 weights) at their exact native GGUF footprint in GPU memory.
   - Packs `fp16` block scales into `u32` pairs unpacked via WGSL `unpack2x16float` (saving ~11% VRAM without requiring `shader-f16`).
@@ -27,16 +27,16 @@ Zero-dependency, mobile-optimized WebGPU inference engine for **PrismML Bonsai 1
 
 ### Model Lineup & Measured Speed (`hachiue` WebGPU)
 
-| Model | Base Arch | Format | bpw | File Size | iPhone 17 Pro Max (Safari) | Apple Silicon Mac (Chrome) |
-| :--- | :--- | :--- | ---: | ---: | ---: | ---: |
-| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(prefill 187 ms)* | **87.6 tok/s** *(prefill 127 ms)* |
-| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | Supported | Supported |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | Supported | **37.8 tok/s** |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | Supported | Supported |
-| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | Supported | Supported |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | Supported | Supported |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* | Supported |
-| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | Supported | Supported |
+| Model | Base Arch | Format | bpw | File Size | iPhone 17 Pro Max (Chrome) |
+| :--- | :--- | :--- | ---: | ---: | :--- |
+| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(prefill 187 ms)* |
+| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | Supported |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | Supported |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | Supported |
+| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | Supported |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | Supported |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* |
+| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | Supported |
 
 ### Published Quality Benchmarks
 
