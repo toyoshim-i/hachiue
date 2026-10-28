@@ -230,7 +230,7 @@
   </footer>
 
   <script type="module">
-    import { HachiueEngine, clearModelCache, isModelCached } from '../dist/index.js'
+    import { HachiueEngine, clearModelCache, getCachedModelSize } from '../dist/index.js'
 
     const modelSelect = document.getElementById('modelSelect')
     const loadBtn = document.getElementById('loadBtn')
@@ -356,19 +356,18 @@
 
     async function refreshCacheBadges() {
       let cachedCount = 0
+      let cachedBytes = 0
       for (const opt of modelSelect.options) {
-        const cached = await isModelCached(opt.value)
-        if (cached) cachedCount++
+        const size = await getCachedModelSize(opt.value)
+        if (size > 0) {
+          cachedCount++
+          cachedBytes += size
+        }
         const base = opt.textContent.replace(/ ✓ cached$/, '')
-        opt.textContent = cached ? `${base} ✓ cached` : base
+        opt.textContent = size > 0 ? `${base} ✓ cached` : base
       }
-      let estText = ''
-      try {
-        const est = await navigator.storage?.estimate?.()
-        if (est?.usage) estText = ` (${fmtBytes(est.usage)} used)`
-      } catch {}
       if (cachedCount > 0) {
-        storageUsage.textContent = `${cachedCount} model${cachedCount > 1 ? 's' : ''} cached${estText}`
+        storageUsage.textContent = `${cachedCount} model${cachedCount > 1 ? 's' : ''} cached (${fmtBytes(cachedBytes)})`
         clearCacheBtn.style.display = 'inline-block'
       } else {
         storageUsage.textContent = ''

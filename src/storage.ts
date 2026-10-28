@@ -103,9 +103,9 @@ async function getOpfsRoot(): Promise<FileSystemDirectoryHandle | null> {
 }
 
 /**
- * Check if a model URL is completely cached in OPFS or IndexedDB.
+ * Return the cached byte size of a model URL if completely cached in OPFS or IndexedDB, or 0 otherwise.
  */
-export async function isModelCached(url: string, expectedTotalBytes?: number): Promise<boolean> {
+export async function getCachedModelSize(url: string, expectedTotalBytes?: number): Promise<number> {
   const key = hashUrl(url)
   const opfs = await getOpfsRoot()
   if (opfs) {
@@ -113,22 +113,29 @@ export async function isModelCached(url: string, expectedTotalBytes?: number): P
       const metaHandle = await opfs.getFileHandle(`${key}.meta.json`)
       const metaFile = await metaHandle.getFile()
       const meta = JSON.parse(await metaFile.text()) as CacheMeta
-      if (expectedTotalBytes && meta.totalSize !== expectedTotalBytes) return false
+      if (expectedTotalBytes && meta.totalSize !== expectedTotalBytes) return 0
       const totalChunks = Math.ceil(meta.totalSize / meta.chunkBytes)
-      return meta.completedChunks.length === totalChunks
+      return meta.completedChunks.length === totalChunks ? meta.totalSize : 0
     } catch {
       // Fall through to IDB check
     }
   }
   try {
     const meta = await idbGet<CacheMeta>(`meta:${key}`)
-    if (!meta) return false
-    if (expectedTotalBytes && meta.totalSize !== expectedTotalBytes) return false
+    if (!meta) return 0
+    if (expectedTotalBytes && meta.totalSize !== expectedTotalBytes) return 0
     const totalChunks = Math.ceil(meta.totalSize / meta.chunkBytes)
-    return meta.completedChunks.length === totalChunks
+    return meta.completedChunks.length === totalChunks ? meta.totalSize : 0
   } catch {
-    return false
+    return 0
   }
+}
+
+/**
+ * Check if a model URL is completely cached in OPFS or IndexedDB.
+ */
+export async function isModelCached(url: string, expectedTotalBytes?: number): Promise<boolean> {
+  return (await getCachedModelSize(url, expectedTotalBytes)) > 0
 }
 
 /**
