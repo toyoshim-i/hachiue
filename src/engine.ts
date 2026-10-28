@@ -22,7 +22,7 @@ const UNIFORM = 0x0040
 const STORAGE = 0x0080
 const STORAGE_COPY = STORAGE | COPY_DST | COPY_SRC
 const UNIFORM_COPY = UNIFORM | COPY_DST
-const PREFILL_CHUNK = 16 // Max tokens per prefill segment to bound scratch memory on mobile
+const PREFILL_CHUNK = 8 // Max tokens per prefill segment to bound scratch memory on mobile
 
 interface QuantChunkBuffer {
   rowStart: number
@@ -43,17 +43,50 @@ interface GpuTensor {
   chunks?: QuantChunkBuffer[]
 }
 
+interface ScratchBuffers {
+  curH: GPUBuffer
+  nextH: GPUBuffer
+  h2: GPUBuffer
+  n1: GPUBuffer
+  n2: GPUBuffer
+  rotBuf: GPUBuffer
+  permBuf: GPUBuffer
+  qkvMixed: GPUBuffer
+  qkvConv: GPUBuffer
+  aProj: GPUBuffer
+  bProj: GPUBuffer
+  gbeta: GPUBuffer
+  core: GPUBuffer
+  zGate: GPUBuffer
+  normed: GPUBuffer
+  qgBuf: GPUBuffer
+  qBuf: GPUBuffer
+  gateBuf: GPUBuffer
+  kBuf: GPUBuffer
+  vBuf: GPUBuffer
+  qNormed: GPUBuffer
+  kNormed: GPUBuffer
+  attOut: GPUBuffer
+  mlpGate: GPUBuffer
+  mlpUp: GPUBuffer
+  swigluOut: GPUBuffer
+  lastHidden: GPUBuffer
+  finalNorm: GPUBuffer
+}
+
 /**
  * Create a progressive byte-streaming splitter that splits raw GGUF blocks
  * (`Q1_0`, `PQ2_0`, `PTQ1_0`) into planar `quants` and `scales16` GPU buffers
- * without ever holding the full tensor in CPU RAM.
+ * using a single shared staging buffer pair (`qStage`, `sStage`) so CPU RAM stays < 2 MiB.
  */
 function createBlockSplitter(
   device: GPUDevice,
   type: GgmlType,
   chunks: QuantChunkBuffer[],
   K: number,
-): { push: (bytes: Uint8Array) => number; finish: () => void } {
+  qStage: Uint8Array<ArrayBuffer>,
+  sStage: Uint8Array<ArrayBuffer>,
+): { push: (bytes: Uint8Array) => number; finish: () => number } {
   const nb = K / 128
   const blockSize = type === GgmlType.Q1_0 ? 18 : type === GgmlType.PQ2_0 ? 34 : 28
   const quantBytesPerBlock = blockSize - 2
@@ -62,9 +95,7 @@ function createBlockSplitter(
   let blockInChunk = 0
   let totalBlocksInCurChunk = chunks[0].rowCount * nb
 
-  const MAX_STAGE = 4 * 1024 * 1024 // 4 MiB staging flush
-  const qStage = new Uint8Array(MAX_STAGE)
-  const sStage = new Uint8Array(MAX_STAGE)
+  const maxStage = qStage.byteLength
   let qStageLen = 0
   let sStageLen = 0
   let qGpuOffset = 0
@@ -78,6 +109,7 @@ function createBlockSplitter(
     const c = chunks[chunkIdx]
     if (qStageLen > 0) {
       const aligned = (qStageLen + 3) & ~3
+      if (aligned > qStageLen) qStage.fill(0, qStageLen, aligned)
       device.queue.writeBuffer(c.quants, qGpuOffset, qStage, 0, aligned)
       qGpuOffset += qStageLen
       written += aligned
@@ -85,6 +117,7 @@ function createBlockSplitter(
     }
     if (sStageLen > 0) {
       const aligned = (sStageLen + 3) & ~3
+      if (aligned > sStageLen) sStage.fill(0, sStageLen, aligned)
       device.queue.writeBuffer(c.scales16, sGpuOffset, sStage, 0, aligned)
       sGpuOffset += sStageLen
       written += aligned
@@ -111,7 +144,7 @@ function createBlockSplitter(
 
     blockInChunk++
     // Every 2 blocks: qStageLen is a multiple of 32 (Q1_0), 64 (PQ2_0), or 52 (PTQ1_0), and sStageLen is a multiple of 4
-    if ((blockInChunk & 1) === 0 && qStageLen + 1024 >= MAX_STAGE) {
+    if ((blockInChunk & 1) === 0 && qStageLen + 1024 >= maxStage) {
       bytesFlushed += flushStaging()
     }
 
@@ -152,11 +185,11 @@ function createBlockSplitter(
       }
       return flushed
     },
-    finish: (): void => {
+    finish: (): number => {
       if (leftoverLen !== 0) {
         throw new Error(`hachiue: incomplete quantized block at end of tensor (${leftoverLen} leftover bytes)`)
       }
-      flushStaging()
+      return flushStaging()
     },
   }
 }
@@ -193,6 +226,7 @@ export class HachiueEngine {
   private readonly dummyBuf: GPUBuffer
   private readonly logitsBuf: GPUBuffer
   private readonly logitsReadBuf: GPUBuffer
+  private readonly logitsCpu: Float32Array
   private readonly argmaxBuf: GPUBuffer
   private readonly argmaxReadBuf: GPUBuffer
   private readonly tokensBuf: GPUBuffer
@@ -206,6 +240,11 @@ export class HachiueEngine {
   // Gated-DeltaNet persistent recurrent & conv state for linear-attention layers
   private readonly ssmConvState: Map<number, [GPUBuffer, GPUBuffer]>
   private readonly ssmRecState: Map<number, [GPUBuffer, GPUBuffer]>
+  private readonly scratch: ScratchBuffers
+  private readonly uniformPool: GPUBuffer[] = []
+  private uniformCursor = 0
+  private readonly uniformScratch = new ArrayBuffer(32)
+  private readonly uniformView = new DataView(this.uniformScratch)
   private ssmParity = 0
   private cachePos = 0
   private tokenHistory: number[] = []
@@ -234,6 +273,7 @@ export class HachiueEngine {
 
     const mkBuf = (size: number, usage = STORAGE_COPY): GPUBuffer =>
       device.createBuffer({ size: Math.max(16, (size + 3) & ~3), usage })
+    const mkAct = (elems: number): GPUBuffer => mkBuf(elems * 4)
 
     this.dummyBuf = mkBuf(64)
     this.logitsBuf = mkBuf(this.arch.vocab * 4)
@@ -241,12 +281,58 @@ export class HachiueEngine {
       size: this.arch.vocab * 4,
       usage: MAP_READ | COPY_DST,
     })
+    this.logitsCpu = new Float32Array(this.arch.vocab)
     this.argmaxBuf = mkBuf(16)
     this.argmaxReadBuf = device.createBuffer({
       size: 16,
       usage: MAP_READ | COPY_DST,
     })
     this.tokensBuf = mkBuf(PREFILL_CHUNK * 4)
+
+    const Hd = this.arch.hidden
+    const F = this.arch.intermediate
+    const H = this.arch.heads
+    const KV = this.arch.kvHeads
+    const Dh = this.arch.headDim
+    const qDim = H * Dh
+    const kvDim = KV * Dh
+    const hy = this.arch.hybrid
+    const NV = hy ? hy.linearValueHeads : 1
+    const DKV = hy ? hy.linearHeadDim : 1
+    const valDim = hy ? NV * DKV : Hd
+    const convDim = hy ? (hy.linearKeyHeads * 2 + NV) * DKV : Hd
+    const maxRotDim = Math.max(Hd, F, qDim, valDim)
+
+    this.scratch = {
+      curH: mkAct(PREFILL_CHUNK * Hd),
+      nextH: mkAct(PREFILL_CHUNK * Hd),
+      h2: mkAct(PREFILL_CHUNK * Hd),
+      n1: mkAct(PREFILL_CHUNK * Hd),
+      n2: mkAct(PREFILL_CHUNK * Hd),
+      rotBuf: mkAct(PREFILL_CHUNK * maxRotDim),
+      permBuf: mkAct(PREFILL_CHUNK * valDim),
+      qkvMixed: mkAct(PREFILL_CHUNK * convDim),
+      qkvConv: mkAct(PREFILL_CHUNK * convDim),
+      aProj: mkAct(PREFILL_CHUNK * NV),
+      bProj: mkAct(PREFILL_CHUNK * NV),
+      gbeta: mkAct(2 * PREFILL_CHUNK * NV),
+      core: mkAct(PREFILL_CHUNK * valDim),
+      zGate: mkAct(PREFILL_CHUNK * valDim),
+      normed: mkAct(PREFILL_CHUNK * valDim),
+      qgBuf: mkAct(PREFILL_CHUNK * qDim * (this.arch.archName === 'qwen35' ? 2 : 1)),
+      qBuf: mkAct(PREFILL_CHUNK * qDim),
+      gateBuf: mkAct(PREFILL_CHUNK * qDim),
+      kBuf: mkAct(PREFILL_CHUNK * kvDim),
+      vBuf: mkAct(PREFILL_CHUNK * kvDim),
+      qNormed: mkAct(PREFILL_CHUNK * qDim),
+      kNormed: mkAct(PREFILL_CHUNK * kvDim),
+      attOut: mkAct(PREFILL_CHUNK * qDim),
+      mlpGate: mkAct(PREFILL_CHUNK * F),
+      mlpUp: mkAct(PREFILL_CHUNK * F),
+      swigluOut: mkAct(PREFILL_CHUNK * F),
+      lastHidden: mkAct(Hd),
+      finalNorm: mkAct(Hd),
+    }
 
     this.kCacheQ = new Map()
     this.kCacheS = new Map()
@@ -255,7 +341,6 @@ export class HachiueEngine {
     this.ssmConvState = new Map()
     this.ssmRecState = new Map()
 
-    const kvDim = this.arch.kvHeads * this.arch.headDim
     const qBytes = maxSeqLen * kvDim // 1 byte per element in Q8_0
     const sBytes = maxSeqLen * (kvDim / 32) * 4 // 1 float32 scale per 32 elements
 
@@ -352,16 +437,20 @@ export class HachiueEngine {
     device.queue.writeBuffer(sinBuf, 0, sin.buffer as ArrayBuffer, sin.byteOffset, sin.byteLength)
 
     // Allocate GPU buffers for all tensors and register stream consumers
-    const maxChunkBindBytes = Math.min(device.limits.maxStorageBufferBindingSize, 128 * 1024 * 1024)
+    const maxChunkBindBytes = Math.min(device.limits.maxStorageBufferBindingSize, 64 * 1024 * 1024)
     const weights = new Map<string, GpuTensor>()
+
+    // Single shared staging buffers across all tensors (1 MiB quants + 128 KiB scales)
+    const sharedQStage = new Uint8Array(new ArrayBuffer(1024 * 1024))
+    const sharedSStage = new Uint8Array(new ArrayBuffer(128 * 1024))
 
     interface StreamRoute {
       absStart: number
       absEnd: number
       push: (bytes: Uint8Array) => number
-      finish: () => void
+      finish: () => number
     }
-    const routes: StreamRoute[] = []
+    const routes: Array<StreamRoute | null> = []
 
     const sortedTensors: GgufTensorInfo[] = Object.values(header.tensors).sort((a, b) => a.absOffset - b.absOffset)
 
@@ -385,24 +474,28 @@ export class HachiueEngine {
               gpuOff += b.byteLength
               return b.byteLength
             },
-            finish: () => {},
+            finish: () => 0,
           })
         } else {
-          const rawF16 = new Uint8Array(t.byteLength)
+          let rawF16: Uint8Array | null = null
           let wOff = 0
           routes.push({
             absStart: t.absOffset,
             absEnd: t.absOffset + t.byteLength,
             push: (b: Uint8Array): number => {
+              if (!rawF16) rawF16 = new Uint8Array(t.byteLength)
               rawF16.set(b, wOff)
               wOff += b.byteLength
               return 0
             },
-            finish: () => {
+            finish: (): number => {
+              if (!rawF16) return 0
               const dv = new DataView(rawF16.buffer, rawF16.byteOffset, rawF16.byteLength)
               const f32Arr = new Float32Array(numElems)
               for (let i = 0; i < numElems; i++) f32Arr[i] = fp16ToFp32(dv.getUint16(i * 2, true))
               device!.queue.writeBuffer(f32Buf, 0, f32Arr)
+              rawF16 = null
+              return f32Arr.byteLength
             },
           })
         }
@@ -435,7 +528,7 @@ export class HachiueEngine {
         }
         weights.set(t.name, gpuTensor)
 
-        const splitter = createBlockSplitter(device, t.type, chunks, K)
+        const splitter = createBlockSplitter(device, t.type, chunks, K, sharedQStage, sharedSStage)
         routes.push({
           absStart: t.absOffset,
           absEnd: t.absOffset + t.byteLength,
@@ -457,12 +550,9 @@ export class HachiueEngine {
       })
     }
 
-    // Stream chunks from OPFS / HTTP Range with GPU staging backpressure
+    // Stream chunks from OPFS / IndexedDB / HTTP Range with strict per-chunk GPU sync & GC yield
     let routeIdx = 0
-    let stagedBytesSinceSync = 0
-    const SYNC_THRESHOLD = 16 * 1024 * 1024 // Wait for GPU queue every 16 MiB to prevent staging OOM on mobile
-
-    const firstTensorOffset = routes.length > 0 ? routes[0].absStart : header.dataStartOffset
+    const firstTensorOffset = routes.length > 0 && routes[0] ? routes[0].absStart : header.dataStartOffset
     await streamModelChunks(
       options.url,
       firstTensorOffset,
@@ -471,7 +561,8 @@ export class HachiueEngine {
         const chunkEnd = chunkFileOffset + chunk.byteLength
         while (routeIdx < routes.length) {
           const r = routes[routeIdx]
-          if (r.absEnd <= chunkFileOffset) {
+          if (!r || r.absEnd <= chunkFileOffset) {
+            routes[routeIdx] = null
             routeIdx++
             continue
           }
@@ -481,19 +572,20 @@ export class HachiueEngine {
           const sliceStart = Math.max(0, r.absStart - chunkFileOffset)
           const sliceEnd = Math.min(chunk.byteLength, r.absEnd - chunkFileOffset)
           if (sliceEnd > sliceStart) {
-            stagedBytesSinceSync += r.push(chunk.subarray(sliceStart, sliceEnd))
+            r.push(chunk.subarray(sliceStart, sliceEnd))
           }
           if (chunkFileOffset + sliceEnd === r.absEnd) {
             r.finish()
+            routes[routeIdx] = null
             routeIdx++
           } else {
             break
           }
         }
-        if (stagedBytesSinceSync >= SYNC_THRESHOLD) {
-          stagedBytesSinceSync = 0
-          await device!.queue.onSubmittedWorkDone()
-        }
+        // Wait for GPU queue to retire staging copies and yield a macrotask turn so mobile browser GC
+        // frees the 16 MiB chunk ArrayBuffer immediately (especially critical when reading fast from local cache).
+        await device!.queue.onSubmittedWorkDone()
+        await new Promise((resolve) => setTimeout(resolve, 0))
       },
       options,
     )
@@ -523,15 +615,18 @@ export class HachiueEngine {
   }
 
   private mkUniform(words: Array<number>, floatIndices: Set<number> = new Set()): GPUBuffer {
-    const byteLen = Math.max(16, Math.ceil(words.length / 4) * 16)
-    const ab = new ArrayBuffer(byteLen)
-    const dv = new DataView(ab)
-    for (let i = 0; i < words.length; i++) {
-      if (floatIndices.has(i)) dv.setFloat32(i * 4, words[i], true)
-      else dv.setUint32(i * 4, words[i] >>> 0, true)
+    for (let i = 0; i < 8; i++) {
+      const val = i < words.length ? words[i] : 0
+      if (floatIndices.has(i)) this.uniformView.setFloat32(i * 4, val, true)
+      else this.uniformView.setUint32(i * 4, val >>> 0, true)
     }
-    const buf = this.device.createBuffer({ size: byteLen, usage: UNIFORM_COPY })
-    this.device.queue.writeBuffer(buf, 0, ab)
+    const idx = this.uniformCursor++
+    let buf = this.uniformPool[idx]
+    if (!buf) {
+      buf = this.device.createBuffer({ size: 32, usage: UNIFORM_COPY })
+      this.uniformPool.push(buf)
+    }
+    this.device.queue.writeBuffer(buf, 0, this.uniformScratch)
     return buf
   }
 
@@ -563,13 +658,11 @@ export class HachiueEngine {
     rows: number,
     width: number,
     mode: 0 | 1,
-    tempBufs: GPUBuffer[],
   ): void {
     if (!this.arch.hadamard) return
     const signBuf = this.hadamardSigns.get(width)
     const hasSigns = signBuf ? 1 : 0
     const u = this.mkUniform([rows, width, mode, hasSigns])
-    tempBufs.push(u)
     const totalBlocks = rows * (width >> 9)
     this.dispatch(pass, 'hadamard_512', u, [srcBuf, signBuf ?? this.dummyBuf, dstBuf], totalBlocks)
   }
@@ -581,13 +674,11 @@ export class HachiueEngine {
     rows: number,
     dim: number,
     outBuf: GPUBuffer,
-    tempBufs: GPUBuffer[],
   ): void {
     const w = this.weights.get(weightName)
     if (!w?.f32Buf) throw new Error(`hachiue: missing norm tensor ${weightName}`)
     // Note: GGUF converter already bakes (1 + weight) into Qwen3.5 RMSNorm tensors.
     const u = this.mkUniform([rows, dim, this.arch.rmsEps, 0], new Set([2]))
-    tempBufs.push(u)
     this.dispatch(pass, 'rmsnorm', u, [xBuf, w.f32Buf, outBuf], rows)
   }
 
@@ -598,7 +689,6 @@ export class HachiueEngine {
     M: number,
     outBuf: GPUBuffer,
     residBuf: GPUBuffer | null,
-    tempBufs: GPUBuffer[],
     rotMemo: Map<GPUBuffer, GPUBuffer>,
   ): void {
     const w = this.weights.get(weightName)
@@ -608,9 +698,22 @@ export class HachiueEngine {
     if (w.hadamardFolded && this.arch.hadamard) {
       let rot = rotMemo.get(xBuf)
       if (!rot) {
-        rot = this.device.createBuffer({ size: Math.max(16, M * w.K * 4), usage: STORAGE_COPY })
-        tempBufs.push(rot)
-        this.runHadamard(pass, xBuf, rot, M, w.K, 0, tempBufs)
+        let srcForRot = xBuf
+        if (
+          this.arch.hadamard.gdnVGrouped &&
+          weightName.includes('.ssm_out.') &&
+          this.arch.hybrid &&
+          this.arch.hybrid.linearValueHeads > this.arch.hybrid.linearKeyHeads
+        ) {
+          const hd = this.arch.hybrid.linearHeadDim
+          const nk = this.arch.hybrid.linearKeyHeads
+          const rep = this.arch.hybrid.linearValueHeads / nk
+          const uPerm = this.mkUniform([M, hd, nk, rep])
+          this.dispatch(pass, 'permute_gdn', uPerm, [xBuf, this.scratch.permBuf], Math.ceil((M * w.K) / 256))
+          srcForRot = this.scratch.permBuf
+        }
+        rot = this.scratch.rotBuf
+        this.runHadamard(pass, srcForRot, rot, M, w.K, 0)
         rotMemo.set(xBuf, rot)
       }
       inputBuf = rot
@@ -621,7 +724,6 @@ export class HachiueEngine {
       const gx = Math.min(groups, 65535)
       const gy = Math.ceil(groups / gx)
       const u = this.mkUniform([M, w.N, w.K, gx])
-      tempBufs.push(u)
       this.dispatch(pass, 'gemv_f32', u, [inputBuf, w.f32Buf, outBuf], gx, gy, M)
       return
     }
@@ -634,8 +736,7 @@ export class HachiueEngine {
       const groups = Math.ceil(chunk.rowCount / 4)
       const gx = Math.min(groups, 65535)
       const gy = Math.ceil(groups / gx)
-      const u = this.mkUniform([M, chunk.rowCount, w.K, w.nb, gx, residBuf ? 1 : 0, chunk.rowStart, 0])
-      tempBufs.push(u)
+      const u = this.mkUniform([M, chunk.rowCount, w.K, w.nb, gx, residBuf ? 1 : 0, chunk.rowStart, w.N])
       this.dispatch(
         pass,
         shader,
@@ -650,7 +751,7 @@ export class HachiueEngine {
 
   /**
    * Run forward pass for a segment of `tokenIds` (`S <= PREFILL_CHUNK`) starting at `this.cachePos`.
-   * If `computeLogits` is true, computes logits for the last token in the segment.
+   * Reuses pre-allocated scratch activation and uniform buffers so zero GPU buffers are allocated per step.
    */
   async forwardSegment(
     tokenIds: number[],
@@ -669,14 +770,10 @@ export class HachiueEngine {
     const Hd = this.arch.hidden
     const F = this.arch.intermediate
     const rotDim = this.arch.rope.rotaryDim
+    const sc = this.scratch
 
-    const tempBufs: GPUBuffer[] = []
+    this.uniformCursor = 0
     const rotMemo = new Map<GPUBuffer, GPUBuffer>()
-    const mkAct = (elems: number): GPUBuffer => {
-      const b = this.device.createBuffer({ size: Math.max(16, elems * 4), usage: STORAGE_COPY })
-      tempBufs.push(b)
-      return b
-    }
 
     const tokArr = new Uint32Array(tokenIds)
     this.device.queue.writeBuffer(this.tokensBuf, 0, tokArr)
@@ -687,10 +784,10 @@ export class HachiueEngine {
     // 1. Embedding Lookup
     const embdW = this.weights.get('token_embd.weight')!
     const embMode = embdW.type === GgmlType.Q1_0 ? 0 : embdW.type === GgmlType.PQ2_0 ? 1 : 2
-    let curH = mkAct(S * Hd)
+    let curH = sc.curH
+    let nextH = sc.nextH
     for (const embChunk of embdW.chunks!) {
       const uEmb = this.mkUniform([Hd, embMode, S, embChunk.rowStart, embChunk.rowCount, 0, 0, 0])
-      tempBufs.push(uEmb)
       this.dispatch(
         pass,
         'embed_gather',
@@ -702,18 +799,16 @@ export class HachiueEngine {
     }
 
     if (this.arch.hadamard?.inverseWeights.has('token_embd.weight')) {
-      const unrotH = mkAct(S * Hd)
-      this.runHadamard(pass, curH, unrotH, S, Hd, 1, tempBufs)
-      curH = unrotH
+      this.runHadamard(pass, curH, nextH, S, Hd, 1)
+      ;[curH, nextH] = [nextH, curH]
     }
 
     // 2. Transformer Layers
     for (let li = 0; li < this.arch.layers; li++) {
-      const n1 = mkAct(S * Hd)
-      this.runRmsNorm(pass, curH, `blk.${li}.attn_norm.weight`, S, Hd, n1, tempBufs)
+      this.runRmsNorm(pass, curH, `blk.${li}.attn_norm.weight`, S, Hd, sc.n1)
+      rotMemo.clear()
 
       const isLinear = this.arch.hybrid && this.arch.hybrid.layerTypes[li] === 'linear'
-      const h2 = mkAct(S * Hd)
 
       if (isLinear && this.arch.hybrid) {
         const hy = this.arch.hybrid
@@ -727,14 +822,12 @@ export class HachiueEngine {
         const loadState = this.cachePos > 0 ? 1 : 0
         const par = this.ssmParity
 
-        const qkvMixed = mkAct(S * convDim)
-        this.runMatmul(pass, `blk.${li}.attn_qkv.weight`, n1, S, qkvMixed, null, tempBufs, rotMemo)
+        this.runMatmul(pass, `blk.${li}.attn_qkv.weight`, sc.n1, S, sc.qkvMixed, null, rotMemo)
+        this.runMatmul(pass, `blk.${li}.attn_gate.weight`, sc.n1, S, sc.zGate, null, rotMemo)
 
-        const qkvConv = mkAct(S * convDim)
         const convW = this.weights.get(`blk.${li}.ssm_conv1d.weight`)!.f32Buf!
         const convStates = this.ssmConvState.get(li)!
         const uConv = this.mkUniform([S, convDim, convK, loadState])
-        tempBufs.push(uConv)
         const totalConvThreads = S * convDim + (convK - 1) * convDim
         const convGroups = Math.ceil(totalConvThreads / 64)
         const cgx = Math.min(convGroups, 65535)
@@ -743,133 +836,116 @@ export class HachiueEngine {
           pass,
           'conv1d_causal',
           uConv,
-          [qkvMixed, convW, convStates[par], qkvConv, convStates[par ^ 1]],
+          [sc.qkvMixed, convW, convStates[par], sc.qkvConv, convStates[par ^ 1]],
           cgx,
           cgy,
         )
 
-        const aProj = mkAct(S * NV)
-        const bProj = mkAct(S * NV)
-        this.runMatmul(pass, `blk.${li}.ssm_alpha.weight`, n1, S, aProj, null, tempBufs, rotMemo)
-        this.runMatmul(pass, `blk.${li}.ssm_beta.weight`, n1, S, bProj, null, tempBufs, rotMemo)
+        this.runMatmul(pass, `blk.${li}.ssm_alpha.weight`, sc.n1, S, sc.aProj, null, rotMemo)
+        this.runMatmul(pass, `blk.${li}.ssm_beta.weight`, sc.n1, S, sc.bProj, null, rotMemo)
 
-        const gbeta = mkAct(2 * S * NV)
         const aNegBuf = this.weights.get(`blk.${li}.ssm_a`)!.f32Buf!
         const dtBiasBuf = this.weights.get(`blk.${li}.ssm_dt.bias`)!.f32Buf!
         const uGb = this.mkUniform([S, NV, 0, 0])
-        tempBufs.push(uGb)
-        this.dispatch(pass, 'deltanet_gbeta', uGb, [aProj, bProj, aNegBuf, dtBiasBuf, gbeta], Math.ceil((S * NV) / 64))
+        this.dispatch(
+          pass,
+          'deltanet_gbeta',
+          uGb,
+          [sc.aProj, sc.bProj, aNegBuf, dtBiasBuf, sc.gbeta],
+          Math.ceil((S * NV) / 64),
+        )
 
-        const core = mkAct(S * valDim)
         const recStates = this.ssmRecState.get(li)!
         const uRec = this.mkUniform([S, NV, DKV, DKV, NK, loadState, 0, 0])
-        tempBufs.push(uRec)
-        this.dispatch(pass, 'deltanet_recur', uRec, [qkvConv, gbeta, recStates[par], core, recStates[par ^ 1]], NV)
+        this.dispatch(
+          pass,
+          'deltanet_recur',
+          uRec,
+          [sc.qkvConv, sc.gbeta, recStates[par], sc.core, recStates[par ^ 1]],
+          NV,
+        )
 
-        const zGate = mkAct(S * valDim)
-        this.runMatmul(pass, `blk.${li}.attn_gate.weight`, n1, S, zGate, null, tempBufs, rotMemo)
-
-        const normed = mkAct(S * valDim)
         const ssmNormBuf = this.weights.get(`blk.${li}.ssm_norm.weight`)!.f32Buf!
         const uNormG = this.mkUniform([S * NV, DKV, this.arch.rmsEps, 0], new Set([2]))
-        tempBufs.push(uNormG)
-        this.dispatch(pass, 'deltanet_norm_gate', uNormG, [core, zGate, ssmNormBuf, normed], S * NV)
+        this.dispatch(pass, 'deltanet_norm_gate', uNormG, [sc.core, sc.zGate, ssmNormBuf, sc.normed], S * NV)
 
-        this.runMatmul(pass, `blk.${li}.ssm_out.weight`, normed, S, h2, curH, tempBufs, rotMemo)
+        rotMemo.clear()
+        this.runMatmul(pass, `blk.${li}.ssm_out.weight`, sc.normed, S, sc.h2, curH, rotMemo)
       } else {
         // Full Attention Layer (Qwen3 dense or Qwen3.5 full-attn interval layer)
         const isQwen35Full = this.arch.archName === 'qwen35'
-        let qBuf: GPUBuffer
-        let gateBuf: GPUBuffer | null = null
 
         if (isQwen35Full) {
-          const qgBuf = mkAct(S * H * Dh * 2)
-          this.runMatmul(pass, `blk.${li}.attn_q.weight`, n1, S, qgBuf, null, tempBufs, rotMemo)
-          qBuf = mkAct(S * H * Dh)
-          gateBuf = mkAct(S * H * Dh)
+          this.runMatmul(pass, `blk.${li}.attn_q.weight`, sc.n1, S, sc.qgBuf, null, rotMemo)
           const uSplit = this.mkUniform([S, H, Dh, 0])
-          tempBufs.push(uSplit)
-          this.dispatch(pass, 'split_q_gate', uSplit, [qgBuf, qBuf, gateBuf], Math.ceil((S * H * Dh) / 256))
+          this.dispatch(pass, 'split_q_gate', uSplit, [sc.qgBuf, sc.qBuf, sc.gateBuf], Math.ceil((S * H * Dh) / 256))
         } else {
-          qBuf = mkAct(S * H * Dh)
-          this.runMatmul(pass, `blk.${li}.attn_q.weight`, n1, S, qBuf, null, tempBufs, rotMemo)
+          this.runMatmul(pass, `blk.${li}.attn_q.weight`, sc.n1, S, sc.qBuf, null, rotMemo)
         }
 
-        const kBuf = mkAct(S * KV * Dh)
-        const vBuf = mkAct(S * KV * Dh)
-        this.runMatmul(pass, `blk.${li}.attn_k.weight`, n1, S, kBuf, null, tempBufs, rotMemo)
-        this.runMatmul(pass, `blk.${li}.attn_v.weight`, n1, S, vBuf, null, tempBufs, rotMemo)
+        this.runMatmul(pass, `blk.${li}.attn_k.weight`, sc.n1, S, sc.kBuf, null, rotMemo)
+        this.runMatmul(pass, `blk.${li}.attn_v.weight`, sc.n1, S, sc.vBuf, null, rotMemo)
 
         // Per-head Q/K RMSNorm
-        const qNormed = mkAct(S * H * Dh)
-        const kNormed = mkAct(S * KV * Dh)
-        this.runRmsNorm(pass, qBuf, `blk.${li}.attn_q_norm.weight`, S * H, Dh, qNormed, tempBufs)
-        this.runRmsNorm(pass, kBuf, `blk.${li}.attn_k_norm.weight`, S * KV, Dh, kNormed, tempBufs)
+        this.runRmsNorm(pass, sc.qBuf, `blk.${li}.attn_q_norm.weight`, S * H, Dh, sc.qNormed)
+        this.runRmsNorm(pass, sc.kBuf, `blk.${li}.attn_k_norm.weight`, S * KV, Dh, sc.kNormed)
 
         // RoPE (in-place on qNormed and kNormed)
         const uRopeQ = this.mkUniform([S, H, Dh, rotDim, this.cachePos, 0, 0, 0])
         const uRopeK = this.mkUniform([S, KV, Dh, rotDim, this.cachePos, 0, 0, 0])
-        tempBufs.push(uRopeQ, uRopeK)
         this.dispatch(
           pass,
           'rope',
           uRopeQ,
-          [this.cosBuf, this.sinBuf, qNormed],
+          [this.cosBuf, this.sinBuf, sc.qNormed],
           Math.ceil((S * H * (rotDim >> 1)) / 64),
         )
         this.dispatch(
           pass,
           'rope',
           uRopeK,
-          [this.cosBuf, this.sinBuf, kNormed],
+          [this.cosBuf, this.sinBuf, sc.kNormed],
           Math.ceil((S * KV * (rotDim >> 1)) / 64),
         )
 
         // Append K and V to Q8_0 KV Cache
         const uKv = this.mkUniform([S, KV, Dh, this.cachePos])
-        tempBufs.push(uKv)
         const kvBlocks = S * KV * (Dh >> 5)
         const kQ = this.kCacheQ.get(li)!
         const kS = this.kCacheS.get(li)!
         const vQ = this.vCacheQ.get(li)!
         const vS = this.vCacheS.get(li)!
-        this.dispatch(pass, 'kv_append_q8', uKv, [kNormed, kQ, kS], kvBlocks)
-        this.dispatch(pass, 'kv_append_q8', uKv, [vBuf, vQ, vS], kvBlocks)
+        this.dispatch(pass, 'kv_append_q8', uKv, [sc.kNormed, kQ, kS], kvBlocks)
+        this.dispatch(pass, 'kv_append_q8', uKv, [sc.vBuf, vQ, vS], kvBlocks)
 
         // Online GQA Attention
-        const attOut = mkAct(S * H * Dh)
         const uAtt = this.mkUniform([S, H, KV, Dh, this.cachePos, 0, 0, 0])
-        tempBufs.push(uAtt)
-        this.dispatch(pass, 'attention_q8', uAtt, [qNormed, kQ, kS, vQ, vS, attOut], S * H)
+        this.dispatch(pass, 'attention_q8', uAtt, [sc.qNormed, kQ, kS, vQ, vS, sc.attOut], S * H)
 
-        if (gateBuf) {
+        if (isQwen35Full) {
           const uGate = this.mkUniform([S * H * Dh, 0, 0, 0])
-          tempBufs.push(uGate)
-          this.dispatch(pass, 'sigmoid_gate', uGate, [gateBuf, attOut], Math.ceil((S * H * Dh) / 256))
+          this.dispatch(pass, 'sigmoid_gate', uGate, [sc.gateBuf, sc.attOut], Math.ceil((S * H * Dh) / 256))
         }
 
-        this.runMatmul(pass, `blk.${li}.attn_output.weight`, attOut, S, h2, curH, tempBufs, rotMemo)
+        rotMemo.clear()
+        this.runMatmul(pass, `blk.${li}.attn_output.weight`, sc.attOut, S, sc.h2, curH, rotMemo)
       }
 
       // Post-Attention Norm & SwiGLU MLP
       const postNormName =
         this.arch.archName === 'qwen35' ? `blk.${li}.post_attention_norm.weight` : `blk.${li}.ffn_norm.weight`
-      const n2 = mkAct(S * Hd)
-      this.runRmsNorm(pass, h2, postNormName, S, Hd, n2, tempBufs)
+      this.runRmsNorm(pass, sc.h2, postNormName, S, Hd, sc.n2)
 
-      const gate = mkAct(S * F)
-      const up = mkAct(S * F)
-      this.runMatmul(pass, `blk.${li}.ffn_gate.weight`, n2, S, gate, null, tempBufs, rotMemo)
-      this.runMatmul(pass, `blk.${li}.ffn_up.weight`, n2, S, up, null, tempBufs, rotMemo)
+      rotMemo.clear()
+      this.runMatmul(pass, `blk.${li}.ffn_gate.weight`, sc.n2, S, sc.mlpGate, null, rotMemo)
+      this.runMatmul(pass, `blk.${li}.ffn_up.weight`, sc.n2, S, sc.mlpUp, null, rotMemo)
 
-      const swigluOut = mkAct(S * F)
       const uSwi = this.mkUniform([S * F, 0, 0, 0])
-      tempBufs.push(uSwi)
-      this.dispatch(pass, 'swiglu', uSwi, [gate, up, swigluOut], Math.ceil((S * F) / 256))
+      this.dispatch(pass, 'swiglu', uSwi, [sc.mlpGate, sc.mlpUp, sc.swigluOut], Math.ceil((S * F) / 256))
 
-      const nextH = mkAct(S * Hd)
-      this.runMatmul(pass, `blk.${li}.ffn_down.weight`, swigluOut, S, nextH, h2, tempBufs, rotMemo)
-      curH = nextH
+      rotMemo.clear()
+      this.runMatmul(pass, `blk.${li}.ffn_down.weight`, sc.swigluOut, S, nextH, sc.h2, rotMemo)
+      ;[curH, nextH] = [nextH, curH]
     }
 
     if (this.arch.hybrid) {
@@ -881,33 +957,28 @@ export class HachiueEngine {
       pass.end()
       this.device.queue.submit([enc.finish()])
       await this.device.queue.onSubmittedWorkDone()
-      for (const b of tempBufs) b.destroy()
       return {}
     }
 
     // 3. Final RMSNorm & LM Head on the last token of the segment
-    let lastHidden = curH
     if (S > 1) {
       pass.end()
-      lastHidden = mkAct(Hd)
-      enc.copyBufferToBuffer(curH, (S - 1) * Hd * 4, lastHidden, 0, Hd * 4)
+      enc.copyBufferToBuffer(curH, (S - 1) * Hd * 4, sc.lastHidden, 0, Hd * 4)
       const pass2 = enc.beginComputePass()
-      const finalNorm = mkAct(Hd)
-      this.runRmsNorm(pass2, lastHidden, 'output_norm.weight', 1, Hd, finalNorm, tempBufs)
-      this.runMatmul(pass2, 'output.weight', finalNorm, 1, this.logitsBuf, null, tempBufs, rotMemo)
+      this.runRmsNorm(pass2, sc.lastHidden, 'output_norm.weight', 1, Hd, sc.finalNorm)
+      rotMemo.clear()
+      this.runMatmul(pass2, 'output.weight', sc.finalNorm, 1, this.logitsBuf, null, rotMemo)
       if (greedyOnly) {
         const uArg = this.mkUniform([this.arch.vocab, 0, 0, 0])
-        tempBufs.push(uArg)
         this.dispatch(pass2, 'argmax', uArg, [this.logitsBuf, this.argmaxBuf], 1)
       }
       pass2.end()
     } else {
-      const finalNorm = mkAct(Hd)
-      this.runRmsNorm(pass, lastHidden, 'output_norm.weight', 1, Hd, finalNorm, tempBufs)
-      this.runMatmul(pass, 'output.weight', finalNorm, 1, this.logitsBuf, null, tempBufs, rotMemo)
+      this.runRmsNorm(pass, curH, 'output_norm.weight', 1, Hd, sc.finalNorm)
+      rotMemo.clear()
+      this.runMatmul(pass, 'output.weight', sc.finalNorm, 1, this.logitsBuf, null, rotMemo)
       if (greedyOnly) {
         const uArg = this.mkUniform([this.arch.vocab, 0, 0, 0])
-        tempBufs.push(uArg)
         this.dispatch(pass, 'argmax', uArg, [this.logitsBuf, this.argmaxBuf], 1)
       }
       pass.end()
@@ -919,17 +990,15 @@ export class HachiueEngine {
       await this.argmaxReadBuf.mapAsync(GPUMapMode.READ)
       const greedyId = new Uint32Array(this.argmaxReadBuf.getMappedRange())[0]
       this.argmaxReadBuf.unmap()
-      for (const b of tempBufs) b.destroy()
       return { greedyId }
     }
 
     enc.copyBufferToBuffer(this.logitsBuf, 0, this.logitsReadBuf, 0, this.arch.vocab * 4)
     this.device.queue.submit([enc.finish()])
     await this.logitsReadBuf.mapAsync(GPUMapMode.READ)
-    const logits = new Float32Array(this.logitsReadBuf.getMappedRange().slice(0))
+    this.logitsCpu.set(new Float32Array(this.logitsReadBuf.getMappedRange()))
     this.logitsReadBuf.unmap()
-    for (const b of tempBufs) b.destroy()
-    return { logits }
+    return { logits: this.logitsCpu }
   }
 
   /**

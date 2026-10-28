@@ -398,6 +398,7 @@ function parseModelArch(meta: Record<string, unknown>, tensors: Record<string, G
     const version = Number(meta['prism.hadamard.version'])
     const blockSize = Number(meta['prism.hadamard.block_size'] ?? 512)
     const tiedOutput = Boolean(meta['prism.hadamard.tied_output'] ?? false)
+    const gdnVGrouped = Boolean(meta['prism.hadamard.gdn_v_grouped'] ?? false)
     const signMode = String(meta['prism.hadamard.sign_mode'] ?? 'identity') as 'identity' | 'explicit'
     const weightNames = (meta['prism.hadamard.weight_names'] as string[]) ?? []
     const inverseNames = (meta['prism.hadamard.inverse_weight_names'] as string[]) ?? []
@@ -422,6 +423,7 @@ function parseModelArch(meta: Record<string, unknown>, tensors: Record<string, G
       version,
       blockSize,
       tiedOutput,
+      gdnVGrouped,
       signMode,
       signsByWidth,
       foldedWeights,

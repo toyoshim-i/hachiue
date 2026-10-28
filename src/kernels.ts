@@ -314,7 +314,7 @@ struct Params {
   gridX: u32,
   hasResid: u32,
   rowOffset: u32,
-  _pad: u32,
+  totalN: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -388,7 +388,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var r = 0u; r < ROWS; r = r + 1u) {
       let n = rowBase + r;
       if (n < p.N) {
-        let outIdx = m * p.N + p.rowOffset + n;
+        let outIdx = m * p.totalN + p.rowOffset + n;
         let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
         y[outIdx] = totals[r] + resVal;
       }
@@ -413,7 +413,7 @@ struct Params {
   gridX: u32,
   hasResid: u32,
   rowOffset: u32,
-  _pad: u32,
+  totalN: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -487,7 +487,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var r = 0u; r < ROWS; r = r + 1u) {
       let n = rowBase + r;
       if (n < p.N) {
-        let outIdx = m * p.N + p.rowOffset + n;
+        let outIdx = m * p.totalN + p.rowOffset + n;
         let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
         y[outIdx] = totals[r] + resVal;
       }
@@ -522,7 +522,7 @@ struct Params {
   gridX: u32,
   hasResid: u32,
   rowOffset: u32,
-  _pad: u32,
+  totalN: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -630,7 +630,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     for (var r = 0u; r < ROWS; r = r + 1u) {
       let n = rowBase + r;
       if (n < p.N) {
-        let outIdx = m * p.N + p.rowOffset + n;
+        let outIdx = m * p.totalN + p.rowOffset + n;
         let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
         y[outIdx] = totals[r] + resVal;
       }

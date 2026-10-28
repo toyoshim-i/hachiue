@@ -275,7 +275,7 @@
 
         engine = await HachiueEngine.create({
           url,
-          maxSeqLen: 2048,
+          maxSeqLen: 1024,
           onProgress: (p) => {
             if (p.phase === 'weights' && p.totalBytes) {
               const pct = ((p.loadedBytes / p.totalBytes) * 100).toFixed(1)

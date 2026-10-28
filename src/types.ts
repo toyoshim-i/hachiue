@@ -33,6 +33,7 @@ export interface HadamardConfig {
   version: number
   blockSize: number
   tiedOutput: boolean
+  gdnVGrouped: boolean
   signMode: 'identity' | 'explicit'
   /** Map from input width (e.g. 2048, 6144) to +/-1 sign array of that length */
   signsByWidth: Map<number, Int8Array>

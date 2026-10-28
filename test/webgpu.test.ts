@@ -158,7 +158,7 @@ async function run() {
       const qBuf = mkBuf(quantsArr);
       const sBuf = mkBuf(scalesArr);
       const yBuf = mkBuf(new Float32Array(8));
-      const uBuf = mkBuf(new Uint32Array([1, 8, 512, 4, 2, 0, 0, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      const uBuf = mkBuf(new Uint32Array([1, 8, 512, 4, 2, 0, 0, 8]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
       const pipe = pipelines[shaderName];
       const bg = device.createBindGroup({
         layout: pipe.getBindGroupLayout(0),

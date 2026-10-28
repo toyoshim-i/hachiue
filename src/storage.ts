@@ -40,35 +40,35 @@ function openIdb(): Promise<IDBDatabase> {
   })
 }
 
-async function idbGet<T>(key: string): Promise<T | undefined> {
+async function idbGet<T>(key: string, existingDb?: IDBDatabase | null): Promise<T | undefined> {
   if (typeof indexedDB === 'undefined') return undefined
-  const db = await openIdb()
+  const db = existingDb ?? (await openIdb())
   return new Promise((resolve, reject) => {
     const tx = db.transaction(IDB_STORE, 'readonly')
     const req = tx.objectStore(IDB_STORE).get(key)
     req.onsuccess = () => {
-      db.close()
+      if (!existingDb) db.close()
       resolve(req.result as T | undefined)
     }
     req.onerror = () => {
-      db.close()
+      if (!existingDb) db.close()
       reject(req.error)
     }
   })
 }
 
-async function idbPut(key: string, val: unknown): Promise<void> {
+async function idbPut(key: string, val: unknown, existingDb?: IDBDatabase | null): Promise<void> {
   if (typeof indexedDB === 'undefined') return
-  const db = await openIdb()
+  const db = existingDb ?? (await openIdb())
   return new Promise((resolve, reject) => {
     const tx = db.transaction(IDB_STORE, 'readwrite')
     tx.objectStore(IDB_STORE).put(val, key)
     tx.oncomplete = () => {
-      db.close()
+      if (!existingDb) db.close()
       resolve()
     }
     tx.onerror = () => {
-      db.close()
+      if (!existingDb) db.close()
       reject(tx.error)
     }
   })
@@ -182,6 +182,7 @@ export async function streamModelChunks(
   let opfsDir: FileSystemDirectoryHandle | null = null
   let opfsDataFile: File | null = null
   let opfsWritable: FileSystemWritableFileStream | null = null
+  let idbConn: IDBDatabase | null = null
   let meta: CacheMeta = {
     url,
     totalSize,
@@ -215,7 +216,10 @@ export async function streamModelChunks(
     }
     if (!opfsDir) {
       try {
-        const existing = await idbGet<CacheMeta>(`meta:${key}`)
+        if (typeof indexedDB !== 'undefined') {
+          idbConn = await openIdb()
+        }
+        const existing = await idbGet<CacheMeta>(`meta:${key}`, idbConn)
         if (existing && existing.totalSize === totalSize && existing.chunkBytes === chunkBytes) {
           meta = existing
         }
@@ -241,7 +245,7 @@ export async function streamModelChunks(
         // Ignore
       }
     }
-    await idbPut(`meta:${key}`, meta).catch(() => {})
+    await idbPut(`meta:${key}`, meta, idbConn).catch(() => {})
   }
 
   try {
@@ -267,7 +271,7 @@ export async function streamModelChunks(
           }
         } else if (!opfsDir) {
           try {
-            const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`)
+            const cachedChunk = await idbGet<Uint8Array>(`chunk:${key}:${ci}`, idbConn)
             if (cachedChunk && cachedChunk.byteLength === expectedLen) {
               data = cachedChunk
               fromCache = true
@@ -299,7 +303,10 @@ export async function streamModelChunks(
           }
           if (!opfsDir) {
             try {
-              await idbPut(`chunk:${key}:${ci}`, data)
+              if (!idbConn && typeof indexedDB !== 'undefined') {
+                idbConn = await openIdb()
+              }
+              await idbPut(`chunk:${key}:${ci}`, data, idbConn)
               completedSet.add(ci)
               await saveMeta()
             } catch {
@@ -312,6 +319,7 @@ export async function streamModelChunks(
       const sliceOffset = Math.max(0, startOffset - chunkStart)
       const sub = sliceOffset > 0 ? data.subarray(sliceOffset) : data
       await onChunk(sub, chunkStart + sliceOffset)
+      data = null
 
       options.onProgress?.({
         phase: 'weights',
@@ -323,6 +331,9 @@ export async function streamModelChunks(
   } finally {
     if (opfsWritable) {
       await opfsWritable.close().catch(() => {})
+    }
+    if (idbConn) {
+      idbConn.close()
     }
   }
 }
