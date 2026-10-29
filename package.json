@@ -13,12 +13,24 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/toyoshim-i/hachiue.git"
+  },
+  "homepage": "https://toyoshim-i.github.io/hachiue/",
+  "bugs": {
+    "url": "https://github.com/toyoshim-i/hachiue/issues"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/gguf.test.ts",
+    "test:webgpu": "node --import tsx --test test/webgpu.test.ts",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "webgpu",

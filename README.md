@@ -70,10 +70,21 @@ Bonsai 2 adopts the **Qwen3.5** hybrid-attention backbone (`vocab = 248,320` vs 
 | **IFBench** | Complex Instruction Processing | 26.7 | **41.3** | 50.4 | **59.2** |
 | **LongBench v2** | Long-Document Summarization & QA | 26.5 | **38.7** | 42.8 | **50.0** |
 
-## Usage
+## Installation & Usage
+
+```bash
+npm install hachiue
+```
+
+Or import directly in the browser via CDN (zero build step):
+```html
+<script type="module">
+  import { HachiueEngine, prefetchModel } from 'https://cdn.jsdelivr.net/npm/hachiue/+esm';
+</script>
+```
 
 ```ts
-import { HachiueEngine, prefetchModel } from './dist/index.js';
+import { HachiueEngine, prefetchModel } from 'hachiue';
 
 const engine = await HachiueEngine.create({
   url: 'https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf',
