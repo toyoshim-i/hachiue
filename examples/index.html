@@ -337,12 +337,6 @@
     </div>
     <div class="controls">
       <select id="modelSelect">
-        <optgroup label="PLaMo 3 Translate (PFN Dedicated Translation)">
-          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf">PLaMo 3 Translate 0.8B Q4_0 (522 MiB)</option>
-          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_K_M.gguf">PLaMo 3 Translate 0.8B Q4_K_M (546 MiB)</option>
-          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_0.gguf">PLaMo 3 Translate 2B Q4_0 (1,620 MiB)</option>
-          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_K_M.gguf">PLaMo 3 Translate 2B Q4_K_M (1,723 MiB)</option>
-        </optgroup>
         <optgroup label="Bonsai 1 (Binary 1-bit Q1_0)">
           <option value="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf" selected>Bonsai 1.7B Q1_0 (237 MiB)</option>
           <option value="https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf">Bonsai 4B Q1_0 (546 MiB)</option>
@@ -357,6 +351,12 @@
         <optgroup label="Ternary Bonsai 1 (PQ2_0)">
           <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/main/Ternary-Bonsai-1.7B-PQ2_0.gguf">Ternary Bonsai 1.7B PQ2_0 (442 MiB)</option>
           <option value="https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf/resolve/main/Ternary-Bonsai-4B-PQ2_0.gguf">Ternary Bonsai 4B PQ2_0 (1,025 MiB)</option>
+        </optgroup>
+        <optgroup label="PLaMo 3 Translate (PFN Dedicated Translation)">
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf">PLaMo 3 Translate 0.8B Q4_0 (522 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_K_M.gguf">PLaMo 3 Translate 0.8B Q4_K_M (546 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_0.gguf">PLaMo 3 Translate 2B Q4_0 (1,620 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_K_M.gguf">PLaMo 3 Translate 2B Q4_K_M (1,723 MiB)</option>
         </optgroup>
       </select>
       <button id="loadBtn" class="primary">Load Model</button>
@@ -378,12 +378,21 @@
   </div>
 
   <div class="mode-tabs">
-    <button id="tabTranslate" class="mode-tab active">🌐 Translate (Text & Term)</button>
-    <button id="tabChat" class="mode-tab">💬 Chat</button>
+    <button id="tabChat" class="mode-tab active">💬 Chat</button>
+    <button id="tabTranslate" class="mode-tab">🌐 Translate (Text & Term)</button>
+  </div>
+
+  <!-- Chat View -->
+  <div id="chatPanel" class="view-panel">
+    <main id="chatBox"></main>
+    <footer>
+      <input id="promptInput" type="text" placeholder="Type a message..." disabled />
+      <button id="sendBtn" class="primary" disabled>Send</button>
+    </footer>
   </div>
 
   <!-- Translate View -->
-  <div id="translatePanel" class="view-panel">
+  <div id="translatePanel" class="view-panel hidden">
     <div class="translate-container">
       <div class="trans-card">
         <div class="trans-header">
@@ -458,15 +467,6 @@
         </div>
       </div>
     </div>
-  </div>
-
-  <!-- Chat View -->
-  <div id="chatPanel" class="view-panel hidden">
-    <main id="chatBox"></main>
-    <footer>
-      <input id="promptInput" type="text" placeholder="Type a message..." disabled />
-      <button id="sendBtn" class="primary" disabled>Send</button>
-    </footer>
   </div>
 
   <script type="module">
