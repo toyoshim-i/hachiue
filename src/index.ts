@@ -3,6 +3,7 @@ export {
   computeTensorByteLength,
   defaultFetchRange,
   dequantizeBlock128Cpu,
+  dequantizeBlockCpu,
   fetchGgufHeader,
   fp16ToFp32,
   fwhtBlockCpu,
@@ -34,6 +35,7 @@ export type {
   ParsedGgufHeader,
   QuantFormat,
   RopeConfig,
+  SlidingWindowConfig,
   StorageOptions,
   TokenizerData,
 } from './types.js'

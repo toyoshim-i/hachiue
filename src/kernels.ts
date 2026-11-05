@@ -16,8 +16,8 @@
 
 export const SHADERS: Record<string, string> = {
   /**
-   * Embedding gather for Q1_0, PQ2_0, or PTQ1_0 directly from the shared token_embd buffers.
-   * Params: [H, mode (0=Q1_0, 1=PQ2_0, 2=PTQ1_0), tokenCount, rowOffset, rowCount]
+   * Embedding gather for Q1_0 (0), PQ2_0 (1), PTQ1_0 (2), Q4_0 (3), Q4_1 (4), Q4_K (5), Q6_K (6).
+   * Params: [H, mode, tokenCount, rowOffset, rowCount]
    */
   embed_gather: /* wgsl */ `
 struct Params { H: u32, mode: u32, S: u32, rowOffset: u32, rowCount: u32, _p0: u32, _p1: u32, _p2: u32 };
@@ -29,6 +29,16 @@ struct Params { H: u32, mode: u32, S: u32, rowOffset: u32, rowCount: u32, _p0: u
 
 fn readByte(byteIdx: u32) -> u32 {
   return (quants[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xffu;
+}
+
+fn readSByte(byteIdx: u32) -> i32 {
+  let b = readByte(byteIdx);
+  return select(i32(b), i32(b) - 256, b >= 128u);
+}
+
+fn readFp16AtByte(byteIdx: u32) -> f32 {
+  let u16val = readByte(byteIdx) | (readByte(byteIdx + 1u) << 8u);
+  return unpack2x16float(u16val).x;
 }
 
 fn readScale(scaleIdx: u32) -> f32 {
@@ -70,27 +80,88 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   let rawTok = tokens[s];
   if (rawTok < p.rowOffset || rawTok >= p.rowOffset + p.rowCount) { return; }
   let tok = rawTok - p.rowOffset;
-  let nb = p.H >> 7u;
+
   for (var k = lid.x; k < p.H; k = k + 256u) {
-    let blk = k >> 7u;
-    let inBlk = k & 127u;
-    let scale = readScale((tok * nb) + blk);
     var val = 0.0;
-    if (p.mode == 0u) {
-      // Q1_0: 16 bytes (4 u32) per block
-      let wordIdx = (tok * nb + blk) * 4u + (inBlk >> 5u);
-      let bit = (quants[wordIdx] >> (inBlk & 31u)) & 1u;
-      val = select(-scale, scale, bit != 0u);
-    } else if (p.mode == 1u) {
-      // PQ2_0: 32 bytes (8 u32) per block
-      let wordIdx = (tok * nb + blk) * 8u + (inBlk >> 4u);
-      let shift = (inBlk & 15u) * 2u;
-      let q = (quants[wordIdx] >> shift) & 3u;
-      val = f32(i32(q) - 1) * scale;
+    if (p.mode <= 2u) {
+      let nb = p.H >> 7u;
+      let blk = k >> 7u;
+      let inBlk = k & 127u;
+      let scale = readScale((tok * nb) + blk);
+      if (p.mode == 0u) {
+        let wordIdx = (tok * nb + blk) * 4u + (inBlk >> 5u);
+        let bit = (quants[wordIdx] >> (inBlk & 31u)) & 1u;
+        val = select(-scale, scale, bit != 0u);
+      } else if (p.mode == 1u) {
+        let wordIdx = (tok * nb + blk) * 8u + (inBlk >> 4u);
+        let shift = (inBlk & 15u) * 2u;
+        let q = (quants[wordIdx] >> shift) & 3u;
+        val = f32(i32(q) - 1) * scale;
+      } else {
+        let baseByte = (tok * nb + blk) * 26u;
+        val = ptqTrit(baseByte, inBlk) * scale;
+      }
+    } else if (p.mode == 3u) {
+      // Q4_0: 32 elems per 18-byte block
+      let nb = p.H >> 5u;
+      let blk = k >> 5u;
+      let inBlk = k & 31u;
+      let baseByte = (tok * nb + blk) * 18u;
+      let d = readFp16AtByte(baseByte);
+      let qByte = readByte(baseByte + 2u + (inBlk & 15u));
+      let nib = select(qByte & 15u, qByte >> 4u, inBlk >= 16u);
+      val = (f32(nib) - 8.0) * d;
+    } else if (p.mode == 4u) {
+      // Q4_1: 32 elems per 20-byte block
+      let nb = p.H >> 5u;
+      let blk = k >> 5u;
+      let inBlk = k & 31u;
+      let baseByte = (tok * nb + blk) * 20u;
+      let d = readFp16AtByte(baseByte);
+      let m = readFp16AtByte(baseByte + 2u);
+      let qByte = readByte(baseByte + 4u + (inBlk & 15u));
+      let nib = select(qByte & 15u, qByte >> 4u, inBlk >= 16u);
+      val = f32(nib) * d + m;
+    } else if (p.mode == 5u) {
+      // Q4_K: 256 elems per 144-byte block
+      let nb = p.H >> 8u;
+      let blk = k >> 8u;
+      let inBlk = k & 255u;
+      let baseByte = (tok * nb + blk) * 144u;
+      let d = readFp16AtByte(baseByte);
+      let dmin = readFp16AtByte(baseByte + 2u);
+      let sub = inBlk >> 5u; // 0..7
+      let l = inBlk & 31u;
+      var sc: u32 = 0u;
+      var mn: u32 = 0u;
+      if (sub < 4u) {
+        sc = readByte(baseByte + 4u + sub) & 63u;
+        mn = readByte(baseByte + 8u + sub) & 63u;
+      } else {
+        sc = (readByte(baseByte + 8u + sub) & 15u) | ((readByte(baseByte + sub) >> 6u) << 4u);
+        mn = (readByte(baseByte + 8u + sub) >> 4u) | ((readByte(baseByte + 4u + sub) >> 6u) << 4u);
+      }
+      let qByte = readByte(baseByte + 16u + (sub >> 1u) * 32u + l);
+      let nib = select(qByte & 15u, qByte >> 4u, (sub & 1u) != 0u);
+      val = d * f32(sc) * f32(nib) - dmin * f32(mn);
     } else {
-      // PTQ1_0: 26 bytes per block
-      let baseByte = (tok * nb + blk) * 26u;
-      val = ptqTrit(baseByte, inBlk) * scale;
+      // Q6_K: 256 elems per 210-byte block
+      let nb = p.H >> 8u;
+      let blk = k >> 8u;
+      let inBlk = k & 255u;
+      let baseByte = (tok * nb + blk) * 210u;
+      let d = readFp16AtByte(baseByte + 208u);
+      let n = inBlk >> 7u; // 0..1
+      let rem = inBlk & 127u;
+      let qGroup = rem >> 5u; // 0..3
+      let l = rem & 31u;
+      let qlByte = readByte(baseByte + n * 64u + (qGroup & 1u) * 32u + l);
+      let qhByte = readByte(baseByte + 128u + n * 32u + l);
+      let qlNib = select(qlByte & 15u, qlByte >> 4u, qGroup >= 2u);
+      let qhBits = (qhByte >> (qGroup * 2u)) & 3u;
+      let q = i32(qlNib | (qhBits << 4u)) - 32;
+      let sc = readSByte(baseByte + 192u + n * 8u + qGroup * 2u + (l >> 4u));
+      val = d * f32(sc) * f32(q);
     }
     out[s * p.H + k] = val;
   }
@@ -640,6 +711,409 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 `,
 
   /**
+   * Multi-row GEMV / Small-Batch GEMM for Q4_0 (18B per 32-weight block: 2B fp16 d + 16B nibbles).
+   * Each thread handles one 32-weight block per step.
+   */
+  gemv_q4_0: /* wgsl */ `
+const WG: u32 = 64u;
+const ROWS: u32 = 4u;
+
+struct Params {
+  M: u32,
+  N: u32,
+  K: u32,
+  nb: u32,
+  gridX: u32,
+  hasResid: u32,
+  rowOffset: u32,
+  totalN: u32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> quants: array<u32>;
+@group(0) @binding(3) var<storage, read> scales16: array<u32>;
+@group(0) @binding(4) var<storage, read> resid: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+
+var<workgroup> sdata: array<vec4<f32>, 64>;
+
+fn readByte(byteIdx: u32) -> u32 {
+  return (quants[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xffu;
+}
+
+fn readFp16AtByte(byteIdx: u32) -> f32 {
+  let u16val = readByte(byteIdx) | (readByte(byteIdx + 1u) << 8u);
+  return unpack2x16float(u16val).x;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rowBase = (wg.y * p.gridX + wg.x) * ROWS;
+  let m = wg.z;
+  if (m >= p.M) { return; }
+  let tid = lid.x;
+  let xRowBase = m * p.K;
+
+  var acc = vec4<f32>(0.0);
+
+  for (var blk = tid; blk < p.nb; blk = blk + WG) {
+    let xBlkBase = xRowBase + blk * 32u;
+    var xSum = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) {
+      xSum = xSum + x[xBlkBase + j];
+    }
+
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let baseByte = (n * p.nb + blk) * 18u + (scales16[0] & 0u);
+        let d = readFp16AtByte(baseByte);
+        var qDot = 0.0;
+        for (var j = 0u; j < 16u; j = j + 1u) {
+          let qb = readByte(baseByte + 2u + j);
+          qDot = qDot + x[xBlkBase + j] * f32(qb & 15u) + x[xBlkBase + 16u + j] * f32(qb >> 4u);
+        }
+        acc[r] = acc[r] + (qDot - 8.0 * xSum) * d;
+      }
+    }
+  }
+
+  sdata[tid] = acc;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { sdata[tid] = sdata[tid] + sdata[tid + s]; }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    let totals = sdata[0];
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let outIdx = m * p.totalN + p.rowOffset + n;
+        let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
+        y[outIdx] = totals[r] + resVal;
+      }
+    }
+  }
+}
+`,
+
+  /**
+   * Multi-row GEMV / Small-Batch GEMM for Q4_1 (20B per 32-weight block: 2B fp16 d + 2B fp16 m + 16B nibbles).
+   * Note: Every 20B block is 4-byte aligned!
+   */
+  gemv_q4_1: /* wgsl */ `
+const WG: u32 = 64u;
+const ROWS: u32 = 4u;
+
+struct Params {
+  M: u32,
+  N: u32,
+  K: u32,
+  nb: u32,
+  gridX: u32,
+  hasResid: u32,
+  rowOffset: u32,
+  totalN: u32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> quants: array<u32>;
+@group(0) @binding(3) var<storage, read> scales16: array<u32>;
+@group(0) @binding(4) var<storage, read> resid: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+
+var<workgroup> sdata: array<vec4<f32>, 64>;
+
+fn readByte(byteIdx: u32) -> u32 {
+  return (quants[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xffu;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rowBase = (wg.y * p.gridX + wg.x) * ROWS;
+  let m = wg.z;
+  if (m >= p.M) { return; }
+  let tid = lid.x;
+  let xRowBase = m * p.K;
+
+  var acc = vec4<f32>(0.0);
+
+  for (var blk = tid; blk < p.nb; blk = blk + WG) {
+    let xBlkBase = xRowBase + blk * 32u;
+    var xSum = 0.0;
+    for (var j = 0u; j < 32u; j = j + 1u) {
+      xSum = xSum + x[xBlkBase + j];
+    }
+
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let wordBase = (n * p.nb + blk) * 5u + (scales16[0] & 0u);
+        let dm = unpack2x16float(quants[wordBase]);
+        let d = dm.x;
+        let mn = dm.y;
+        let baseByte = wordBase * 4u + 4u;
+        var qDot = 0.0;
+        for (var j = 0u; j < 16u; j = j + 1u) {
+          let qb = readByte(baseByte + j);
+          qDot = qDot + x[xBlkBase + j] * f32(qb & 15u) + x[xBlkBase + 16u + j] * f32(qb >> 4u);
+        }
+        acc[r] = acc[r] + qDot * d + xSum * mn;
+      }
+    }
+  }
+
+  sdata[tid] = acc;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { sdata[tid] = sdata[tid] + sdata[tid + s]; }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    let totals = sdata[0];
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let outIdx = m * p.totalN + p.rowOffset + n;
+        let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
+        y[outIdx] = totals[r] + resVal;
+      }
+    }
+  }
+}
+`,
+
+  /**
+   * Multi-row GEMV / Small-Batch GEMM for Q4_K (144B per 256-weight super-block).
+   * Each unit `u` is one 32-weight sub-block (`numUnits = nb * 8`).
+   * Note: 144 bytes = 36 u32 words (4-byte aligned!).
+   */
+  gemv_q4_k: /* wgsl */ `
+const WG: u32 = 64u;
+const ROWS: u32 = 4u;
+
+struct Params {
+  M: u32,
+  N: u32,
+  K: u32,
+  nb: u32,
+  gridX: u32,
+  hasResid: u32,
+  rowOffset: u32,
+  totalN: u32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> quants: array<u32>;
+@group(0) @binding(3) var<storage, read> scales16: array<u32>;
+@group(0) @binding(4) var<storage, read> resid: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+
+var<workgroup> sdata: array<vec4<f32>, 64>;
+
+fn readByte(byteIdx: u32) -> u32 {
+  return (quants[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xffu;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rowBase = (wg.y * p.gridX + wg.x) * ROWS;
+  let m = wg.z;
+  if (m >= p.M) { return; }
+  let tid = lid.x;
+  let numUnits = p.nb * 8u; // 8 sub-blocks of 32 weights per 256-weight super-block
+  let xRowBase = m * p.K;
+
+  var acc = vec4<f32>(0.0);
+
+  for (var u = tid; u < numUnits; u = u + WG) {
+    let blk = u >> 3u;
+    let sub = u & 7u;
+    let xSubBase = xRowBase + u * 32u;
+    let isHigh = (sub & 1u) != 0u;
+    let pairIdx = sub >> 1u;
+
+    var xSum = 0.0;
+    for (var l = 0u; l < 32u; l = l + 1u) {
+      xSum = xSum + x[xSubBase + l];
+    }
+
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let blkWordBase = (n * p.nb + blk) * 36u + (scales16[0] & 0u);
+        let baseByte = blkWordBase * 4u;
+        let dm = unpack2x16float(quants[blkWordBase]);
+        let d = dm.x;
+        let dmin = dm.y;
+
+        var sc: u32 = 0u;
+        var mn: u32 = 0u;
+        if (sub < 4u) {
+          sc = readByte(baseByte + 4u + sub) & 63u;
+          mn = readByte(baseByte + 8u + sub) & 63u;
+        } else {
+          sc = (readByte(baseByte + 8u + sub) & 15u) | ((readByte(baseByte + sub) >> 6u) << 4u);
+          mn = (readByte(baseByte + 8u + sub) >> 4u) | ((readByte(baseByte + 4u + sub) >> 6u) << 4u);
+        }
+
+        let qBaseByte = baseByte + 16u + pairIdx * 32u;
+        var qDot = 0.0;
+        for (var l = 0u; l < 32u; l = l + 1u) {
+          let qb = readByte(qBaseByte + l);
+          let nib = select(qb & 15u, qb >> 4u, isHigh);
+          qDot = qDot + x[xSubBase + l] * f32(nib);
+        }
+        acc[r] = acc[r] + (d * f32(sc)) * qDot - (dmin * f32(mn)) * xSum;
+      }
+    }
+  }
+
+  sdata[tid] = acc;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { sdata[tid] = sdata[tid] + sdata[tid + s]; }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    let totals = sdata[0];
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let outIdx = m * p.totalN + p.rowOffset + n;
+        let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
+        y[outIdx] = totals[r] + resVal;
+      }
+    }
+  }
+}
+`,
+
+  /**
+   * Multi-row GEMV / Small-Batch GEMM for Q6_K (210B per 256-weight super-block).
+   * Each unit `u` is one 32-weight slice (`numUnits = nb * 8`).
+   */
+  gemv_q6_k: /* wgsl */ `
+const WG: u32 = 64u;
+const ROWS: u32 = 4u;
+
+struct Params {
+  M: u32,
+  N: u32,
+  K: u32,
+  nb: u32,
+  gridX: u32,
+  hasResid: u32,
+  rowOffset: u32,
+  totalN: u32,
+};
+
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read> quants: array<u32>;
+@group(0) @binding(3) var<storage, read> scales16: array<u32>;
+@group(0) @binding(4) var<storage, read> resid: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+
+var<workgroup> sdata: array<vec4<f32>, 64>;
+
+fn readByte(byteIdx: u32) -> u32 {
+  return (quants[byteIdx >> 2u] >> ((byteIdx & 3u) * 8u)) & 0xffu;
+}
+
+fn readSByte(byteIdx: u32) -> i32 {
+  let b = readByte(byteIdx);
+  return select(i32(b), i32(b) - 256, b >= 128u);
+}
+
+fn readFp16AtByte(byteIdx: u32) -> f32 {
+  let u16val = readByte(byteIdx) | (readByte(byteIdx + 1u) << 8u);
+  return unpack2x16float(u16val).x;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rowBase = (wg.y * p.gridX + wg.x) * ROWS;
+  let m = wg.z;
+  if (m >= p.M) { return; }
+  let tid = lid.x;
+  let numUnits = p.nb * 8u; // 8 sub-blocks of 32 weights per 256-weight super-block
+  let xRowBase = m * p.K;
+
+  var acc = vec4<f32>(0.0);
+
+  for (var u = tid; u < numUnits; u = u + WG) {
+    let blk = u >> 3u;
+    let sub = u & 7u;
+    let nHalf = sub >> 2u; // 0 or 1
+    let qGroup = sub & 3u; // 0..3
+    let xSubBase = xRowBase + u * 32u;
+
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let rowIdx = rowBase + r;
+      if (rowIdx < p.N) {
+        let baseByte = (rowIdx * p.nb + blk) * 210u + (scales16[0] & 0u);
+        let d = readFp16AtByte(baseByte + 208u);
+        let qlBase = baseByte + nHalf * 64u + (qGroup & 1u) * 32u;
+        let qhBase = baseByte + 128u + nHalf * 32u;
+        let scBase = baseByte + 192u + nHalf * 8u + qGroup * 2u;
+        let sc0 = f32(readSByte(scBase));
+        let sc1 = f32(readSByte(scBase + 1u));
+        let qhShift = qGroup * 2u;
+        let isUpperNib = qGroup >= 2u;
+
+        var sum0 = 0.0;
+        for (var l = 0u; l < 16u; l = l + 1u) {
+          let qlb = readByte(qlBase + l);
+          let qhb = readByte(qhBase + l);
+          let qlNib = select(qlb & 15u, qlb >> 4u, isUpperNib);
+          let qhBits = (qhb >> qhShift) & 3u;
+          let q = f32(i32(qlNib | (qhBits << 4u)) - 32);
+          sum0 = sum0 + x[xSubBase + l] * q;
+        }
+        var sum1 = 0.0;
+        for (var l = 16u; l < 32u; l = l + 1u) {
+          let qlb = readByte(qlBase + l);
+          let qhb = readByte(qhBase + l);
+          let qlNib = select(qlb & 15u, qlb >> 4u, isUpperNib);
+          let qhBits = (qhb >> qhShift) & 3u;
+          let q = f32(i32(qlNib | (qhBits << 4u)) - 32);
+          sum1 = sum1 + x[xSubBase + l] * q;
+        }
+        acc[r] = acc[r] + d * (sc0 * sum0 + sc1 * sum1);
+      }
+    }
+  }
+
+  sdata[tid] = acc;
+  workgroupBarrier();
+  for (var s = 32u; s > 0u; s = s >> 1u) {
+    if (tid < s) { sdata[tid] = sdata[tid] + sdata[tid + s]; }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    let totals = sdata[0];
+    for (var r = 0u; r < ROWS; r = r + 1u) {
+      let n = rowBase + r;
+      if (n < p.N) {
+        let outIdx = m * p.totalN + p.rowOffset + n;
+        let resVal = select(0.0, resid[outIdx], p.hasResid != 0u);
+        y[outIdx] = totals[r] + resVal;
+      }
+    }
+  }
+}
+`,
+
+  /**
    * RoPE (supports full or partial rotary_dim, e.g. rotary_dim=64 on head_dim=256 for Qwen3.5).
    * In-place on q or k buffer `[S, H, Dh]`.
    */
@@ -695,6 +1169,77 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   let srcBase = sh * (p.Dh * 2u);
   q[idx] = qg[srcBase + d];
   gate[idx] = qg[srcBase + p.Dh + d];
+}
+`,
+
+  /**
+   * Split fused QKV `[S, qDim + 2 * kvDim]` into `q [S, qDim]`, `k [S, kvDim]`, `v [S, kvDim]` for PLaMo-3 layers.
+   */
+  split_qkv: /* wgsl */ `
+struct Params { S: u32, qDim: u32, kvDim: u32, _pad: u32 };
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> qkv: array<f32>;
+@group(0) @binding(2) var<storage, read_write> q: array<f32>;
+@group(0) @binding(3) var<storage, read_write> k: array<f32>;
+@group(0) @binding(4) var<storage, read_write> v: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rowStride = p.qDim + 2u * p.kvDim;
+  let total = p.S * rowStride;
+  let idx = wg.x * 256u + lid.x;
+  if (idx >= total) { return; }
+  let s = idx / rowStride;
+  let col = idx % rowStride;
+  let val = qkv[idx];
+  if (col < p.qDim) {
+    q[s * p.qDim + col] = val;
+  } else if (col < p.qDim + p.kvDim) {
+    k[s * p.kvDim + (col - p.qDim)] = val;
+  } else {
+    v[s * p.kvDim + (col - p.qDim - p.kvDim)] = val;
+  }
+}
+`,
+
+  /**
+   * Fused SwiGLU for concatenated Gate+Up `[S, 2 * F]`: out[s, i] = silu(gateUp[s, i]) * gateUp[s, F + i].
+   */
+  swiglu_fused: /* wgsl */ `
+struct Params { S: u32, F: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> gateUp: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let total = p.S * p.F;
+  let idx = wg.x * 256u + lid.x;
+  if (idx >= total) { return; }
+  let s = idx / p.F;
+  let col = idx % p.F;
+  let base = s * (p.F * 2u);
+  let g = gateUp[base + col];
+  let u = gateUp[base + p.F + col];
+  out[idx] = (g / (1.0 + exp(-g))) * u;
+}
+`,
+
+  /**
+   * Elementwise vector addition: dst[i] = a[i] + b[i].
+   */
+  add_inplace: /* wgsl */ `
+struct Params { N: u32, _p0: u32, _p1: u32, _p2: u32 };
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let idx = wg.x * 256u + lid.x;
+  if (idx >= p.N) { return; }
+  dst[idx] = a[idx] + b[idx];
 }
 `,
 
@@ -790,11 +1335,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 `,
 
   /**
-   * Online Softmax GQA Attention with Q8_0 KV Cache.
+   * Online Softmax GQA Attention with Q8_0 KV Cache (supports optional sliding window size `windowSize > 0`).
    * One workgroup (32 threads) per (query_pos, query_head).
    */
   attention_q8: /* wgsl */ `
-struct Params { S: u32, H: u32, KV: u32, Dh: u32, posBase: u32, _p0: u32, _p1: u32, _p2: u32 };
+struct Params { S: u32, H: u32, KV: u32, Dh: u32, posBase: u32, windowSize: u32, _p1: u32, _p2: u32 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> q: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> Kq: array<u32>;
@@ -825,7 +1370,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   var m = -1e30;
   var l = 0.0;
 
-  for (var j = 0u; j <= pos; j = j + 1u) {
+  // In PLaMo-3 swa_mask: key_positions > query_positions - window_size => j >= pos + 1 - windowSize
+  var jStart = 0u;
+  if (p.windowSize > 0u && pos + 1u > p.windowSize) {
+    jStart = pos + 1u - p.windowSize;
+  }
+
+  for (var j = jStart; j <= pos; j = j + 1u) {
     let kvRow = j * p.KV + kvh;
     let qWordBase = kvRow * W4;
     let sBlockBase = kvRow * B32;

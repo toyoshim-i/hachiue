@@ -33,20 +33,48 @@ const { byteToChar, charToByte } = buildByteEncoder()
 const PRE_TOKENIZE_REGEX =
   /(?:'[sSdDmMtT]|'[rR][eE]|'[vV][eE]|'[lL][lL])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu
 
+// PLaMo-3 Unigram DP constants matching pfnet/plamo-3-translate tokenization_plamo.py
+const PLAMO_INVALID_SCORE = -20000000
+const PLAMO_UNKNOWN_SCORE = -10000000
+const PLAMO_BOUNDARY_CHAR = '\uee00'
+const PLAMO_BOUNDARY_CP = 0xee00
+const PLAMO_BOUNDARY_TOKEN_ID = 10000000
+
+interface UnigramTrieNode {
+  children: Map<number, UnigramTrieNode>
+  tokenId: number
+  score: number
+}
+
 export class GgufTokenizer {
+  readonly model: string
   private readonly tokens: string[]
   private readonly tokenToIdMap: Map<string, number>
   private readonly mergeRanks: Map<string, number>
   private readonly specialTokens: string[]
   private readonly specialTokenIds: Set<number>
   private readonly specialRegex: RegExp | null
+  // Unigram / PLaMo-3 fields
+  private readonly isPlamo3: boolean
+  private readonly unigramRoot: UnigramTrieNode | null
+  private readonly byteTokenIds: Int32Array | null
+  private readonly plamoSpRegex: RegExp | null
+  private readonly plamoBoundaryRegex: RegExp | null
+  readonly addBosToken: boolean
   readonly eosTokenId: number
+  readonly eomTokenId?: number
+  readonly eotTokenId?: number
   readonly bosTokenId?: number
   readonly padTokenId?: number
 
   constructor(data: TokenizerData) {
+    this.model = data.model ?? 'gpt2'
+    this.isPlamo3 = this.model === 'plamo3'
     this.tokens = data.tokens
+    this.addBosToken = data.addBosToken
     this.eosTokenId = data.eosTokenId
+    this.eomTokenId = data.eomTokenId
+    this.eotTokenId = data.eotTokenId
     this.bosTokenId = data.bosTokenId
     this.padTokenId = data.padTokenId
 
@@ -58,28 +86,102 @@ export class GgufTokenizer {
       const t = data.tokens[id]
       this.tokenToIdMap.set(t, id)
       const ttype = data.tokenTypes?.[id]
-      // GGUF token_type: 1 = normal, 3 = control, 4 = user_defined (e.g. <think>, <|im_start|>)
-      if ((ttype !== undefined && ttype !== 1) || (t.startsWith('<') && t.endsWith('>') && t.length > 2)) {
-        if (!t.startsWith('[PAD')) {
+      if (this.isPlamo3) {
+        // In plamo3: type 2 = unknown, type 3 = control (<|plamo:*|>), type 6 = byte (<0xXX>)
+        if (ttype === 2 || ttype === 3) {
           this.specialTokens.push(t)
           this.specialTokenIds.add(id)
+        }
+      } else {
+        // GGUF token_type: 1 = normal, 3 = control, 4 = user_defined (e.g. <think>, <|im_start|>)
+        if ((ttype !== undefined && ttype !== 1) || (t.startsWith('<') && t.endsWith('>') && t.length > 2)) {
+          if (!t.startsWith('[PAD')) {
+            this.specialTokens.push(t)
+            this.specialTokenIds.add(id)
+          }
         }
       }
     }
 
-    // Sort longer special tokens first so greedy alternation matches longest
-    this.specialTokens.sort((a, b) => b.length - a.length)
-    if (this.specialTokens.length > 0) {
-      const escaped = this.specialTokens.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      this.specialRegex = new RegExp(`(${escaped.join('|')})`, 'g')
-    } else {
+    if (this.isPlamo3) {
       this.specialRegex = null
-    }
+      this.mergeRanks = new Map()
+      const root: UnigramTrieNode = { children: new Map(), tokenId: -1, score: PLAMO_INVALID_SCORE }
+      const byteIds = new Int32Array(256)
+      const scores = data.scores ?? []
+      const ttypes = data.tokenTypes ?? []
 
-    this.mergeRanks = new Map<string, number>()
-    for (let i = 0; i < data.merges.length; i++) {
-      this.mergeRanks.set(data.merges[i], i)
+      for (let id = 0; id < data.tokens.length; id++) {
+        const tok = data.tokens[id]
+        const tt = ttypes[id] ?? 1
+        if (tt === 6 && tok.length === 6 && tok.startsWith('<0x') && tok.endsWith('>')) {
+          const byteVal = Number.parseInt(tok.slice(3, 5), 16)
+          if (!Number.isNaN(byteVal) && byteVal >= 0 && byteVal < 256) {
+            byteIds[byteVal] = id
+          }
+          continue
+        }
+        let node = root
+        for (let i = 0; i < tok.length; ) {
+          const cp = tok.codePointAt(i)!
+          i += cp > 0xffff ? 2 : 1
+          let child = node.children.get(cp)
+          if (!child) {
+            child = { children: new Map(), tokenId: -1, score: PLAMO_INVALID_SCORE }
+            node.children.set(cp, child)
+          }
+          node = child
+        }
+        node.tokenId = id
+        const sc = scores[id] ?? 0
+        node.score = Number.isFinite(sc) ? Math.round(sc * 1e4) : PLAMO_INVALID_SCORE
+      }
+
+      // Add internal boundary character U+EE00 matching tokenization_plamo.py
+      root.children.set(PLAMO_BOUNDARY_CP, {
+        children: new Map(),
+        tokenId: PLAMO_BOUNDARY_TOKEN_ID,
+        score: 0,
+      })
+
+      this.unigramRoot = root
+      this.byteTokenIds = byteIds
+      this.plamoSpRegex = /(<\|plamo:[^|\s]{0,64}\|>)/g
+
+      const spaceThresh = data.breakAroundConsecutiveSpacesThreshold ?? 2
+      const repeatThresh = data.breakAroundRepeatedCharsThreshold ?? 4
+      const patterns: string[] = []
+      if (repeatThresh > 1) {
+        patterns.push(`(.)\\2{${repeatThresh - 1},}`)
+      }
+      if (spaceThresh > 1) {
+        patterns.push(` {${spaceThresh},}`)
+      }
+      this.plamoBoundaryRegex = patterns.length > 0 ? new RegExp(`(${patterns.join('|')})`, 'gu') : null
+    } else {
+      this.unigramRoot = null
+      this.byteTokenIds = null
+      this.plamoSpRegex = null
+      this.plamoBoundaryRegex = null
+
+      // Sort longer special tokens first so greedy alternation matches longest
+      this.specialTokens.sort((a, b) => b.length - a.length)
+      if (this.specialTokens.length > 0) {
+        const escaped = this.specialTokens.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        this.specialRegex = new RegExp(`(${escaped.join('|')})`, 'g')
+      } else {
+        this.specialRegex = null
+      }
+
+      this.mergeRanks = new Map<string, number>()
+      for (let i = 0; i < data.merges.length; i++) {
+        this.mergeRanks.set(data.merges[i], i)
+      }
     }
+  }
+
+  getTokenId(token: string): number | undefined {
+    return this.tokenToIdMap.get(token)
   }
 
   private bpe(piece: string): number[] {
@@ -139,11 +241,108 @@ export class GgufTokenizer {
     return ids
   }
 
+  private encodePlamo3(text: string): number[] {
+    if (!text || !this.unigramRoot || !this.byteTokenIds) return []
+    let s = text
+    if (this.plamoSpRegex) {
+      s = s.replace(this.plamoSpRegex, `${PLAMO_BOUNDARY_CHAR}$1${PLAMO_BOUNDARY_CHAR}`)
+    }
+    if (this.plamoBoundaryRegex) {
+      s = s.replace(this.plamoBoundaryRegex, `${PLAMO_BOUNDARY_CHAR}$1${PLAMO_BOUNDARY_CHAR}`)
+    }
+
+    const cps: number[] = []
+    for (let i = 0; i < s.length; ) {
+      const cp = s.codePointAt(i)!
+      cps.push(cp)
+      i += cp > 0xffff ? 2 : 1
+    }
+
+    const n = cps.length
+    const dpCost = new Float64Array(n + 1)
+    dpCost.fill(1e18)
+    dpCost[n] = 0
+    const pathLen = new Int32Array(n + 1)
+    const pathTid = new Int32Array(n + 1)
+    pathTid.fill(-1)
+
+    const matchLens: number[] = []
+    const matchTids: number[] = []
+    const matchScores: number[] = []
+
+    for (let i = n - 1; i >= 0; i--) {
+      matchLens.length = 0
+      matchTids.length = 0
+      matchScores.length = 0
+
+      let node: UnigramTrieNode | undefined = this.unigramRoot
+      let j = i
+      while (j < n) {
+        node = node.children.get(cps[j])
+        if (!node) break
+        j++
+        if (node.score > PLAMO_INVALID_SCORE) {
+          matchLens.push(j - i)
+          matchTids.push(node.tokenId)
+          matchScores.push(node.score)
+        }
+      }
+
+      // Iterate from longest prefix to shortest with strict `<` (matches tokenization_plamo.py tie-breaking)
+      let bestCost = 1e18
+      let bestLen = 1
+      let bestTid = -1
+      for (let k = matchLens.length - 1; k >= 0; k--) {
+        const plen = matchLens[k]
+        const cost = dpCost[i + plen] - matchScores[k]
+        if (cost < bestCost) {
+          bestCost = cost
+          bestLen = plen
+          bestTid = matchTids[k]
+        }
+      }
+
+      // Sentinel row (length 1, score UNKNOWN_SCORE, tokenId -1)
+      const sentinelCost = dpCost[i + 1] - PLAMO_UNKNOWN_SCORE
+      if (sentinelCost < bestCost) {
+        bestCost = sentinelCost
+        bestLen = 1
+        bestTid = -1
+      }
+
+      dpCost[i] = bestCost
+      pathLen[i] = bestLen
+      pathTid[i] = bestTid
+    }
+
+    const utf8 = new TextEncoder()
+    const out: number[] = []
+    let pos = 0
+    while (pos < n) {
+      const tid = pathTid[pos]
+      if (tid >= 0) {
+        if (tid !== PLAMO_BOUNDARY_TOKEN_ID) {
+          out.push(tid)
+        }
+      } else {
+        const bytes = utf8.encode(String.fromCodePoint(cps[pos]))
+        for (let b = 0; b < bytes.length; b++) {
+          out.push(this.byteTokenIds[bytes[b]])
+        }
+      }
+      pos += pathLen[pos]
+    }
+    return out
+  }
+
   /**
-   * Encode text into token IDs, recognizing ChatML / Qwen special tokens (`<|im_start|>`, `<|im_end|>`, `<think>`, etc.).
+   * Encode text into token IDs, recognizing ChatML / Qwen or PLaMo-3 special tokens.
    */
   encode(text: string): number[] {
     if (!text) return []
+    if (this.isPlamo3) {
+      return this.encodePlamo3(text)
+    }
     if (!this.specialRegex) return this.encodePlainSegment(text)
 
     const ids: number[] = []
@@ -173,12 +372,23 @@ export class GgufTokenizer {
    */
   decode(ids: number[], skipSpecialTokens = true): string {
     const rawBytes: number[] = []
+    const utf8 = new TextEncoder()
     for (const id of ids) {
       if (skipSpecialTokens && this.specialTokenIds.has(id)) continue
       const tok = this.tokens[id]
       if (tok === undefined) continue
-      if (this.specialTokenIds.has(id)) {
-        const encoded = new TextEncoder().encode(tok)
+      if (this.isPlamo3) {
+        if (tok.length === 6 && tok.startsWith('<0x') && tok.endsWith('>')) {
+          const byteVal = Number.parseInt(tok.slice(3, 5), 16)
+          if (!Number.isNaN(byteVal)) {
+            rawBytes.push(byteVal)
+            continue
+          }
+        }
+        const encoded = utf8.encode(tok)
+        for (let i = 0; i < encoded.length; i++) rawBytes.push(encoded[i])
+      } else if (this.specialTokenIds.has(id)) {
+        const encoded = utf8.encode(tok)
         for (const b of encoded) rawBytes.push(b)
       } else {
         for (const ch of tok) {
@@ -186,7 +396,7 @@ export class GgufTokenizer {
           if (b !== undefined) {
             rawBytes.push(b)
           } else {
-            const encoded = new TextEncoder().encode(ch)
+            const encoded = utf8.encode(ch)
             for (const eb of encoded) rawBytes.push(eb)
           }
         }
@@ -224,9 +434,48 @@ export class GgufTokenizer {
   }
 
   /**
-   * Format a ChatML / Qwen3 / Bonsai conversation into a prompt string.
+   * Look up a single token string and return its vocabulary ID if present.
    */
-  formatChat(messages: ChatMessage[], options: { addGenerationPrompt?: boolean; enableThinking?: boolean } = {}): string {
+  tokenToId(token: string): number | undefined {
+    return this.tokenToIdMap.get(token)
+  }
+
+  /**
+   * Format a ChatML / Qwen3 / Bonsai or PLaMo-3 conversation into a prompt string.
+   */
+  formatChat(
+    messages: ChatMessage[],
+    options: { addGenerationPrompt?: boolean; enableThinking?: boolean; targetLang?: string; sourceLang?: string } = {},
+  ): string {
+    if (this.isPlamo3) {
+      // PLaMo-3 Translate embedded GGUF template (PFML3 format)
+      const targetLang = options.targetLang ?? 'ja'
+      const bos = this.bosTokenId !== undefined ? (this.tokens[this.bosTokenId] ?? '<|plamo:bos|>') : '<|plamo:bos|>'
+      let out = `${bos}<|plamo:tag|>dataset<|plamo:msg|>translation`
+      const nonSystem = messages.filter((m) => m.role !== 'system')
+      const sysMsg = messages.find((m) => m.role === 'system')
+      if (sysMsg?.content?.trim()) {
+        out += `<|plamo:tag|>context<|plamo:msg|>${sysMsg.content.trim()}`
+      }
+      for (let i = 0; i < nonSystem.length - 1; i++) {
+        const m = nonSystem[i]
+        if (m.role === 'user') {
+          out += '<|plamo:tag|>input'
+          if (options.sourceLang) out += `<|plamo:key|>lang<|plamo:val|>${options.sourceLang}`
+          out += `<|plamo:msg|>${m.content}`
+        } else {
+          out += `<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>${targetLang}<|plamo:msg|>${m.content}`
+        }
+      }
+      const last = nonSystem[nonSystem.length - 1]
+      if (last) {
+        out += '<|plamo:tag|>input'
+        if (options.sourceLang) out += `<|plamo:key|>lang<|plamo:val|>${options.sourceLang}`
+        out += `<|plamo:msg|>${last.content}<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>${targetLang}<|plamo:msg|>`
+      }
+      return out
+    }
+
     const addGen = options.addGenerationPrompt ?? true
     const think = options.enableThinking ?? false
     let out = ''

@@ -2,12 +2,18 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
 import { describe, it } from 'node:test'
-import { dequantizeBlock128Cpu, fwhtBlockCpu, GgmlType, SHADERS } from '../src/index.js'
+import {
+  dequantizeBlock128Cpu,
+  dequantizeBlockCpu,
+  fwhtBlockCpu,
+  GgmlType,
+  SHADERS,
+} from '../src/index.js'
 
 const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
 
 describe('Real Chrome WebGPU Shader Compilation & Kernel Numerical Accuracy', () => {
-  it('compiles all 17 WGSL compute pipelines cleanly and matches CPU reference for Q1_0, PQ2_0, PTQ1_0 GEMV & FWHT-512', async () => {
+  it('compiles all 24 WGSL compute pipelines cleanly and matches CPU reference for Q1_0, PQ2_0, PTQ1_0, Q4_0, Q4_1, Q4_K, Q6_K GEMV & FWHT-512', async () => {
     // 1. Prepare deterministic test vectors on CPU
     const K = 512
     const N = 8
@@ -97,6 +103,88 @@ describe('Real Chrome WebGPU Shader Compilation & Kernel Numerical Accuracy', ()
     const fwhtExpected = new Float32Array(x)
     fwhtBlockCpu(fwhtExpected, 0, 512)
 
+    // Prepare Q4_0 weights (N=8, K=512 -> nb32 = 16 blocks per row, 18B per block)
+    const nb32 = K / 32
+    const q40Quants = new Uint8Array(N * nb32 * 18)
+    const q40Expected = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let sum = 0
+      for (let b = 0; b < nb32; b++) {
+        const blkOff = (r * nb32 + b) * 18
+        q40Quants[blkOff] = 0x00
+        q40Quants[blkOff + 1] = 0x38 // 0.5
+        for (let i = 0; i < 16; i++) {
+          q40Quants[blkOff + 2 + i] = (r * 29 + b * 17 + i * 7) & 0xff
+        }
+        const deq = new Float32Array(32)
+        dequantizeBlockCpu(q40Quants.subarray(blkOff, blkOff + 18), GgmlType.Q4_0, deq)
+        for (let j = 0; j < 32; j++) sum += x[b * 32 + j] * deq[j]
+      }
+      q40Expected[r] = sum
+    }
+
+    // Prepare Q4_1 weights (N=8, K=512 -> nb32 = 16 blocks per row, 20B per block)
+    const q41Quants = new Uint8Array(N * nb32 * 20)
+    const q41Expected = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let sum = 0
+      for (let b = 0; b < nb32; b++) {
+        const blkOff = (r * nb32 + b) * 20
+        q41Quants[blkOff] = 0x00
+        q41Quants[blkOff + 1] = 0x34 // 0.25
+        q41Quants[blkOff + 2] = 0x00
+        q41Quants[blkOff + 3] = 0xb8 // -0.5
+        for (let i = 0; i < 16; i++) {
+          q41Quants[blkOff + 4 + i] = (r * 37 + b * 19 + i * 11) & 0xff
+        }
+        const deq = new Float32Array(32)
+        dequantizeBlockCpu(q41Quants.subarray(blkOff, blkOff + 20), GgmlType.Q4_1, deq)
+        for (let j = 0; j < 32; j++) sum += x[b * 32 + j] * deq[j]
+      }
+      q41Expected[r] = sum
+    }
+
+    // Prepare Q4_K weights (N=8, K=512 -> nb256 = 2 blocks per row, 144B per block)
+    const nb256 = K / 256
+    const q4kQuants = new Uint8Array(N * nb256 * 144)
+    const q4kExpected = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let sum = 0
+      for (let b = 0; b < nb256; b++) {
+        const blkOff = (r * nb256 + b) * 144
+        q4kQuants[blkOff] = 0x00
+        q4kQuants[blkOff + 1] = 0x30 // 0.125
+        q4kQuants[blkOff + 2] = 0x00
+        q4kQuants[blkOff + 3] = 0x2c // 0.0625
+        for (let i = 4; i < 144; i++) {
+          q4kQuants[blkOff + i] = (r * 41 + b * 23 + i * 13) & 0xff
+        }
+        const deq = new Float32Array(256)
+        dequantizeBlockCpu(q4kQuants.subarray(blkOff, blkOff + 144), GgmlType.Q4_K, deq)
+        for (let j = 0; j < 256; j++) sum += x[b * 256 + j] * deq[j]
+      }
+      q4kExpected[r] = sum
+    }
+
+    // Prepare Q6_K weights (N=8, K=512 -> nb256 = 2 blocks per row, 210B per block)
+    const q6kQuants = new Uint8Array(N * nb256 * 210)
+    const q6kExpected = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let sum = 0
+      for (let b = 0; b < nb256; b++) {
+        const blkOff = (r * nb256 + b) * 210
+        for (let i = 0; i < 208; i++) {
+          q6kQuants[blkOff + i] = (r * 43 + b * 29 + i * 17) & 0xff
+        }
+        q6kQuants[blkOff + 208] = 0x00
+        q6kQuants[blkOff + 209] = 0x2c // 0.0625
+        const deq = new Float32Array(256)
+        dequantizeBlockCpu(q6kQuants.subarray(blkOff, blkOff + 210), GgmlType.Q6_K, deq)
+        for (let j = 0; j < 256; j++) sum += x[b * 256 + j] * deq[j]
+      }
+      q6kExpected[r] = sum
+    }
+
     const html = `<!doctype html>
 <html><body><script type="module">
 const SHADERS = ${JSON.stringify(SHADERS)};
@@ -107,6 +195,10 @@ const pq2Quants = new Uint8Array(${JSON.stringify(Array.from(pq2Quants))});
 const pq2Scales = new Uint16Array(${JSON.stringify(Array.from(pq2Scales16))});
 const ptqQuants = new Uint8Array(${JSON.stringify(Array.from(ptqQuants))});
 const ptqScales = new Uint16Array(${JSON.stringify(Array.from(ptqScales16))});
+const q40Quants = new Uint8Array(${JSON.stringify(Array.from(q40Quants))});
+const q41Quants = new Uint8Array(${JSON.stringify(Array.from(q41Quants))});
+const q4kQuants = new Uint8Array(${JSON.stringify(Array.from(q4kQuants))});
+const q6kQuants = new Uint8Array(${JSON.stringify(Array.from(q6kQuants))});
 
 async function run() {
   try {
@@ -154,12 +246,12 @@ async function run() {
     const xBuf = mkBuf(xData);
     const dummyBuf = mkBuf(new Uint32Array(16));
 
-    const runGemv = async (shaderName, quantsArr, scalesArr) => {
+    const runGemv = async (shaderName, quantsArr, scalesArr, nbCount = 4) => {
       const qBuf = mkBuf(quantsArr);
       const sBuf = mkBuf(scalesArr);
       const yBuf = mkBuf(new Float32Array(8));
-      const uBuf = mkBuf(new Uint32Array([1, 8, 512, 4, 2, 0, 0, 8]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-      const pipe = pipelines[shaderName];
+      const uBuf = mkBuf(new Uint32Array([1, 8, 512, nbCount, 2, 0, 0, 8]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      let pipe = pipelines[shaderName];
       const bg = device.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
         entries: [
@@ -181,9 +273,13 @@ async function run() {
       return await readF32(yBuf, 8);
     };
 
-    const q1Gpu = await runGemv('gemv_q1_0', q1Quants, q1Scales);
-    const pq2Gpu = await runGemv('gemv_pq2_0', pq2Quants, pq2Scales);
-    const ptqGpu = await runGemv('gemv_ptq1_0', ptqQuants, ptqScales);
+    const q1Gpu = await runGemv('gemv_q1_0', q1Quants, q1Scales, 4);
+    const pq2Gpu = await runGemv('gemv_pq2_0', pq2Quants, pq2Scales, 4);
+    const ptqGpu = await runGemv('gemv_ptq1_0', ptqQuants, ptqScales, 4);
+    const q40Gpu = await runGemv('gemv_q4_0', q40Quants, new Uint16Array(8), 16);
+    const q41Gpu = await runGemv('gemv_q4_1', q41Quants, new Uint16Array(8), 16);
+    const q4kGpu = await runGemv('gemv_q4_k', q4kQuants, new Uint16Array(8), 2);
+    const q6kGpu = await runGemv('gemv_q6_k', q6kQuants, new Uint16Array(8), 2);
 
     // Run FWHT-512
     const fwhtDst = mkBuf(new Float32Array(512));
@@ -207,9 +303,92 @@ async function run() {
     device.queue.submit([enc.finish()]);
     const fwhtGpu = await readF32(fwhtDst, 512);
 
+    // Run split_qkv (S=1, qDim=4, kvDim=2 -> total 8 floats)
+    const qkvSrc = mkBuf(new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]));
+    const qDst = mkBuf(new Float32Array(4));
+    const kDst = mkBuf(new Float32Array(2));
+    const vDst = mkBuf(new Float32Array(2));
+    const uSplitQkv = mkBuf(new Uint32Array([1, 4, 2, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const pipeSplitQkv = pipelines['split_qkv'];
+    const bgSplitQkv = device.createBindGroup({
+      layout: pipeSplitQkv.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uSplitQkv } },
+        { binding: 1, resource: { buffer: qkvSrc } },
+        { binding: 2, resource: { buffer: qDst } },
+        { binding: 3, resource: { buffer: kDst } },
+        { binding: 4, resource: { buffer: vDst } },
+      ]
+    });
+
+    // Run swiglu_fused (S=1, F=4 -> gate=[0, 1, -1, 2], up=[2, 3, 4, 5])
+    const gateUpSrc = mkBuf(new Float32Array([0, 1, -1, 2, 2, 3, 4, 5]));
+    const swigluDst = mkBuf(new Float32Array(4));
+    const uSwiFused = mkBuf(new Uint32Array([1, 4, 0, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const pipeSwiFused = pipelines['swiglu_fused'];
+    const bgSwiFused = device.createBindGroup({
+      layout: pipeSwiFused.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uSwiFused } },
+        { binding: 1, resource: { buffer: gateUpSrc } },
+        { binding: 2, resource: { buffer: swigluDst } },
+      ]
+    });
+
+    // Run add_inplace (N=4)
+    const addA = mkBuf(new Float32Array([10, 20, 30, 40]));
+    const addB = mkBuf(new Float32Array([1, 2, 3, 4]));
+    const addOut = mkBuf(new Float32Array(4));
+    const uAdd = mkBuf(new Uint32Array([4, 0, 0, 0]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+    const pipeAdd = pipelines['add_inplace'];
+    const bgAdd = device.createBindGroup({
+      layout: pipeAdd.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: uAdd } },
+        { binding: 1, resource: { buffer: addA } },
+        { binding: 2, resource: { buffer: addB } },
+        { binding: 3, resource: { buffer: addOut } },
+      ]
+    });
+
+    const enc2 = device.createCommandEncoder();
+    const pass2 = enc2.beginComputePass();
+    pass2.setPipeline(pipeSplitQkv);
+    pass2.setBindGroup(0, bgSplitQkv);
+    pass2.dispatchWorkgroups(1, 1, 1);
+    pass2.setPipeline(pipeSwiFused);
+    pass2.setBindGroup(0, bgSwiFused);
+    pass2.dispatchWorkgroups(1, 1, 1);
+    pass2.setPipeline(pipeAdd);
+    pass2.setBindGroup(0, bgAdd);
+    pass2.dispatchWorkgroups(1, 1, 1);
+    pass2.end();
+    device.queue.submit([enc2.finish()]);
+
+    const qOut = await readF32(qDst, 4);
+    const kOut = await readF32(kDst, 2);
+    const vOut = await readF32(vDst, 2);
+    const swigluGpu = await readF32(swigluDst, 4);
+    const addGpu = await readF32(addOut, 4);
+
     await fetch('/report', {
       method: 'POST',
-      body: JSON.stringify({ ok: true, q1Gpu, pq2Gpu, ptqGpu, fwhtGpu })
+      body: JSON.stringify({
+        ok: true,
+        q1Gpu,
+        pq2Gpu,
+        ptqGpu,
+        q40Gpu,
+        q41Gpu,
+        q4kGpu,
+        q6kGpu,
+        fwhtGpu,
+        qOut,
+        kOut,
+        vOut,
+        swigluGpu,
+        addGpu,
+      })
     });
   } catch (err) {
     await fetch('/report', { method: 'POST', body: JSON.stringify({ fatal: String(err.stack || err) }) });
@@ -258,15 +437,37 @@ run();
     const q1Gpu = report.q1Gpu as number[]
     const pq2Gpu = report.pq2Gpu as number[]
     const ptqGpu = report.ptqGpu as number[]
+    const q40Gpu = report.q40Gpu as number[]
+    const q41Gpu = report.q41Gpu as number[]
+    const q4kGpu = report.q4kGpu as number[]
+    const q6kGpu = report.q6kGpu as number[]
     const fwhtGpu = report.fwhtGpu as number[]
 
     for (let r = 0; r < N; r++) {
       assert.ok(Math.abs(q1Gpu[r] - q1Expected[r]) < 1e-3, `Q1_0 row ${r}: ${q1Gpu[r]} vs ${q1Expected[r]}`)
       assert.ok(Math.abs(pq2Gpu[r] - pq2Expected[r]) < 1e-3, `PQ2_0 row ${r}: ${pq2Gpu[r]} vs ${pq2Expected[r]}`)
       assert.ok(Math.abs(ptqGpu[r] - ptqExpected[r]) < 1e-3, `PTQ1_0 row ${r}: ${ptqGpu[r]} vs ${ptqExpected[r]}`)
+      assert.ok(Math.abs(q40Gpu[r] - q40Expected[r]) < 1e-2, `Q4_0 row ${r}: ${q40Gpu[r]} vs ${q40Expected[r]}`)
+      assert.ok(Math.abs(q41Gpu[r] - q41Expected[r]) < 1e-2, `Q4_1 row ${r}: ${q41Gpu[r]} vs ${q41Expected[r]}`)
+      assert.ok(Math.abs(q4kGpu[r] - q4kExpected[r]) < 1e-2, `Q4_K row ${r}: ${q4kGpu[r]} vs ${q4kExpected[r]}`)
+      assert.ok(Math.abs(q6kGpu[r] - q6kExpected[r]) < 1e-2, `Q6_K row ${r}: ${q6kGpu[r]} vs ${q6kExpected[r]}`)
     }
     for (let i = 0; i < 512; i++) {
       assert.ok(Math.abs(fwhtGpu[i] - fwhtExpected[i]) < 1e-4, `FWHT idx ${i}: ${fwhtGpu[i]} vs ${fwhtExpected[i]}`)
+    }
+
+    assert.deepEqual(report.qOut, [1, 2, 3, 4])
+    assert.deepEqual(report.kOut, [5, 6])
+    assert.deepEqual(report.vOut, [7, 8])
+    assert.deepEqual(report.addGpu, [11, 22, 33, 44])
+
+    const swigluGpu = report.swigluGpu as number[]
+    const gates = [0, 1, -1, 2]
+    const ups = [2, 3, 4, 5]
+    for (let i = 0; i < 4; i++) {
+      const g = gates[i]
+      const expected = (g / (1 + Math.exp(-g))) * ups[i]
+      assert.ok(Math.abs(swigluGpu[i] - expected) < 1e-5, `swiglu_fused[${i}]: ${swigluGpu[i]} vs ${expected}`)
     }
   })
 })

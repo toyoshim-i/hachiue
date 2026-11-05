@@ -7,6 +7,7 @@ import {
   type ModelArch,
   type ParsedGgufHeader,
   type RopeConfig,
+  type SlidingWindowConfig,
   type StorageOptions,
   type TokenizerData,
 } from './types.js'
@@ -42,8 +43,16 @@ export function getBlockSpec(type: GgmlType): [number, number] {
       return [1, 4]
     case GgmlType.F16:
       return [1, 2]
+    case GgmlType.Q4_0:
+      return [32, 18] // 2B fp16 d + 16B nibbles
+    case GgmlType.Q4_1:
+      return [32, 20] // 2B fp16 d + 2B fp16 m + 16B nibbles
     case GgmlType.Q8_0:
       return [32, 34]
+    case GgmlType.Q4_K:
+      return [256, 144] // 2B d + 2B dmin + 12B scales + 128B qs
+    case GgmlType.Q6_K:
+      return [256, 210] // 128B ql + 64B qh + 16B scales + 2B d
     case GgmlType.Q1_0:
       return [128, 18] // 2B fp16 scale + 16B sign bits
     case GgmlType.Q2_0:
@@ -134,6 +143,96 @@ export function dequantizeBlock128Cpu(blockBytes: Uint8Array, type: GgmlType, ou
     return
   }
   throw new Error(`dequantizeBlock128Cpu: unsupported type ${type}`)
+}
+
+/**
+ * Reference CPU dequantization for standard GGML blocks (Q4_0, Q4_1, Q4_K, Q6_K).
+ */
+export function dequantizeBlockCpu(blockBytes: Uint8Array, type: GgmlType, out: Float32Array, outOffset = 0): void {
+  const dv = new DataView(blockBytes.buffer, blockBytes.byteOffset, blockBytes.byteLength)
+  if (type === GgmlType.Q4_0) {
+    // 32 elements: [d: fp16 (2B)][qs: 16B]
+    const d = fp16ToFp32(dv.getUint16(0, true))
+    for (let j = 0; j < 16; j++) {
+      const b = blockBytes[2 + j]
+      out[outOffset + j] = ((b & 0x0f) - 8) * d
+      out[outOffset + 16 + j] = ((b >> 4) - 8) * d
+    }
+    return
+  }
+  if (type === GgmlType.Q4_1) {
+    // 32 elements: [d: fp16 (2B)][m: fp16 (2B)][qs: 16B]
+    const d = fp16ToFp32(dv.getUint16(0, true))
+    const m = fp16ToFp32(dv.getUint16(2, true))
+    for (let j = 0; j < 16; j++) {
+      const b = blockBytes[4 + j]
+      out[outOffset + j] = (b & 0x0f) * d + m
+      out[outOffset + 16 + j] = (b >> 4) * d + m
+    }
+    return
+  }
+  if (type === GgmlType.Q4_K) {
+    // 256 elements (144B): [d: fp16 (2B)][dmin: fp16 (2B)][scales: 12B][qs: 128B]
+    const d = fp16ToFp32(dv.getUint16(0, true))
+    const dmin = fp16ToFp32(dv.getUint16(2, true))
+    const sc = new Uint8Array(8)
+    const mn = new Uint8Array(8)
+    for (let j = 0; j < 4; j++) {
+      sc[j] = blockBytes[4 + j] & 63
+      mn[j] = blockBytes[4 + j + 4] & 63
+    }
+    for (let j = 4; j < 8; j++) {
+      sc[j] = (blockBytes[4 + j + 4] & 0x0f) | ((blockBytes[4 + j - 4] >> 6) << 4)
+      mn[j] = (blockBytes[4 + j + 4] >> 4) | ((blockBytes[4 + j] >> 6) << 4)
+    }
+    let qOff = 16
+    let is = 0
+    let yOff = outOffset
+    for (let j = 0; j < 4; j++) {
+      const d1 = d * sc[is]
+      const m1 = dmin * mn[is]
+      const d2 = d * sc[is + 1]
+      const m2 = dmin * mn[is + 1]
+      for (let l = 0; l < 32; l++) {
+        out[yOff + l] = d1 * (blockBytes[qOff + l] & 0x0f) - m1
+        out[yOff + 32 + l] = d2 * (blockBytes[qOff + l] >> 4) - m2
+      }
+      yOff += 64
+      qOff += 32
+      is += 2
+    }
+    return
+  }
+  if (type === GgmlType.Q6_K) {
+    // 256 elements (210B): [ql: 128B][qh: 64B][scales: 16B int8][d: fp16 (2B)]
+    const d = fp16ToFp32(dv.getUint16(208, true))
+    for (let n = 0; n < 2; n++) {
+      const qlBase = n * 64
+      const qhBase = 128 + n * 32
+      const scBase = 192 + n * 8
+      const yBase = outOffset + n * 128
+      for (let l = 0; l < 32; l++) {
+        const is = l >> 4
+        const ql0 = blockBytes[qlBase + l]
+        const ql32 = blockBytes[qlBase + l + 32]
+        const qh = blockBytes[qhBase + l]
+        const q1 = ((ql0 & 0x0f) | (((qh >> 0) & 3) << 4)) - 32
+        const q2 = ((ql32 & 0x0f) | (((qh >> 2) & 3) << 4)) - 32
+        const q3 = ((ql0 >> 4) | (((qh >> 4) & 3) << 4)) - 32
+        const q4 = ((ql32 >> 4) | (((qh >> 6) & 3) << 4)) - 32
+        const s0 = dv.getInt8(scBase + is + 0)
+        const s2 = dv.getInt8(scBase + is + 2)
+        const s4 = dv.getInt8(scBase + is + 4)
+        const s6 = dv.getInt8(scBase + is + 6)
+        out[yBase + l + 0] = d * s0 * q1
+        out[yBase + l + 32] = d * s2 * q2
+        out[yBase + l + 64] = d * s4 * q3
+        out[yBase + l + 96] = d * s6 * q4
+      }
+    }
+    return
+  }
+  dequantizeBlock128Cpu(blockBytes, type, out, outOffset)
 }
 
 /**
@@ -346,8 +445,8 @@ export function parseGgufHeaderBytes(bytes: Uint8Array): ParsedGgufHeader {
 
 function parseModelArch(meta: Record<string, unknown>, tensors: Record<string, GgufTensorInfo>): ModelArch {
   const archStr = String(meta['general.architecture'] ?? '')
-  if (archStr !== 'qwen3' && archStr !== 'qwen35') {
-    throw new Error(`hachiue: unsupported model architecture "${archStr}" (expected "qwen3" or "qwen35")`)
+  if (archStr !== 'qwen3' && archStr !== 'qwen35' && archStr !== 'plamo3') {
+    throw new Error(`hachiue: unsupported model architecture "${archStr}" (expected "qwen3", "qwen35", or "plamo3")`)
   }
   const p = (key: string): unknown => meta[`${archStr}.${key}`]
   const reqNum = (key: string): number => {
@@ -371,18 +470,38 @@ function parseModelArch(meta: Record<string, unknown>, tensors: Record<string, G
   const tieWordEmbeddings = !('output.weight' in tensors)
 
   const eosTokenId = Number(meta['tokenizer.ggml.eos_token_id'] ?? 151645)
+  const eomTokenId =
+    meta['tokenizer.ggml.eom_token_id'] !== undefined ? Number(meta['tokenizer.ggml.eom_token_id']) : undefined
+  const eotTokenId =
+    meta['tokenizer.ggml.eot_token_id'] !== undefined ? Number(meta['tokenizer.ggml.eot_token_id']) : undefined
   const bosTokenId = meta['tokenizer.ggml.bos_token_id'] !== undefined ? Number(meta['tokenizer.ggml.bos_token_id']) : undefined
   const padTokenId = meta['tokenizer.ggml.padding_token_id'] !== undefined ? Number(meta['tokenizer.ggml.padding_token_id']) : undefined
 
   const theta = Number(p('rope.freq_base') ?? 1000000.0)
+  const localTheta = p('rope.freq_base_swa') !== undefined ? Number(p('rope.freq_base_swa')) : undefined
   const ropeScaleType = String(p('rope.scaling.type') ?? 'none')
   const rotaryDim = Number(p('rope.dimension_count') ?? headDim)
   const rope: RopeConfig = {
     theta,
+    localTheta,
     type: ropeScaleType === 'yarn' ? 'yarn' : archStr === 'qwen35' ? 'mrope' : 'normal',
     factor: Number(p('rope.scaling.factor') ?? 1.0),
     originalMaxPositions: Number(p('rope.scaling.original_context_length') ?? maxPositions),
     rotaryDim,
+    yarnBetaFast: p('rope.scaling.yarn_beta_fast') !== undefined ? Number(p('rope.scaling.yarn_beta_fast')) : undefined,
+    yarnBetaSlow: p('rope.scaling.yarn_beta_slow') !== undefined ? Number(p('rope.scaling.yarn_beta_slow')) : undefined,
+    yarnTruncate: p('rope.scaling.yarn_truncate') !== undefined ? Boolean(p('rope.scaling.yarn_truncate')) : undefined,
+  }
+
+  let swa: SlidingWindowConfig | undefined
+  if (archStr === 'plamo3' && p('attention.sliding_window') !== undefined) {
+    const windowSize = Number(p('attention.sliding_window'))
+    const pattern = Number(p('attention.sliding_window_pattern') ?? 8)
+    const layerTypes: Array<'swa' | 'full'> = []
+    for (let li = 0; li < layers; li++) {
+      layerTypes.push((li + 1) % pattern === 0 ? 'full' : 'swa')
+    }
+    swa = { windowSize, pattern, layerTypes }
   }
 
   let hybrid: HybridLayerConfig | undefined
@@ -457,28 +576,48 @@ function parseModelArch(meta: Record<string, unknown>, tensors: Record<string, G
     maxPositions,
     vocab,
     eosTokenId,
+    eomTokenId,
+    eotTokenId,
     bosTokenId,
     padTokenId,
     tieWordEmbeddings,
     rope,
     hybrid,
+    swa,
     hadamard,
   }
 }
 
 function parseTokenizerData(meta: Record<string, unknown>): TokenizerData | undefined {
   const tokens = meta['tokenizer.ggml.tokens'] as string[] | undefined
-  const merges = meta['tokenizer.ggml.merges'] as string[] | undefined
-  if (!tokens || !merges) return undefined
+  if (!tokens) return undefined
+  const model = String(meta['tokenizer.ggml.model'] ?? 'gpt2')
+  const merges = (meta['tokenizer.ggml.merges'] as string[] | undefined) ?? []
+  const scores = meta['tokenizer.ggml.scores'] as number[] | undefined
+  if (model !== 'plamo3' && merges.length === 0 && !scores) return undefined
   return {
+    model,
     tokens,
+    scores,
     tokenTypes: meta['tokenizer.ggml.token_type'] as number[] | undefined,
     merges,
     eosTokenId: Number(meta['tokenizer.ggml.eos_token_id'] ?? 151645),
+    eomTokenId:
+      meta['tokenizer.ggml.eom_token_id'] !== undefined ? Number(meta['tokenizer.ggml.eom_token_id']) : undefined,
+    eotTokenId:
+      meta['tokenizer.ggml.eot_token_id'] !== undefined ? Number(meta['tokenizer.ggml.eot_token_id']) : undefined,
     bosTokenId: meta['tokenizer.ggml.bos_token_id'] !== undefined ? Number(meta['tokenizer.ggml.bos_token_id']) : undefined,
     padTokenId: meta['tokenizer.ggml.padding_token_id'] !== undefined ? Number(meta['tokenizer.ggml.padding_token_id']) : undefined,
     addBosToken: Boolean(meta['tokenizer.ggml.add_bos_token'] ?? false),
     chatTemplate: meta['tokenizer.chat_template'] as string | undefined,
+    breakAroundConsecutiveSpacesThreshold:
+      meta['tokenizer.ggml.break_around_consecutive_spaces_threshold'] !== undefined
+        ? Number(meta['tokenizer.ggml.break_around_consecutive_spaces_threshold'])
+        : undefined,
+    breakAroundRepeatedCharsThreshold:
+      meta['tokenizer.ggml.break_around_repeated_chars_threshold'] !== undefined
+        ? Number(meta['tokenizer.ggml.break_around_repeated_chars_threshold'])
+        : undefined,
   }
 }
 

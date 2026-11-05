@@ -4,7 +4,15 @@
 export enum GgmlType {
   F32 = 0,
   F16 = 1,
+  /** Standard GGML 4-bit symmetric quantization, 32 elements per block (2B fp16 d + 16B nibbles = 18B) */
+  Q4_0 = 2,
+  /** Standard GGML 4-bit affine quantization, 32 elements per block (2B fp16 d + 2B fp16 m + 16B nibbles = 20B) */
+  Q4_1 = 3,
   Q8_0 = 8,
+  /** K-quant 4-bit super-block, 256 elements per block (2B d + 2B dmin + 12B scales + 128B qs = 144B) */
+  Q4_K = 12,
+  /** K-quant 6-bit super-block, 256 elements per block (128B ql + 64B qh + 16B scales + 2B d = 210B) */
+  Q6_K = 14,
   /** Bonsai 1: 1-bit binary weights, 128 elements per block (2B fp16 scale + 16B sign bits = 18B) */
   Q1_0 = 41,
   /** Upstream ternary 2-bit weights, 64 elements per block (2B fp16 scale + 16B 2-bit codes = 18B) */
@@ -15,7 +23,7 @@ export enum GgmlType {
   PTQ1_0 = 143,
 }
 
-export type QuantFormat = 'q1_0' | 'pq2_0' | 'ptq1_0' | 'q2_0' | 'f32' | 'f16'
+export type QuantFormat = 'q1_0' | 'pq2_0' | 'ptq1_0' | 'q2_0' | 'q4_0' | 'q4_1' | 'q4_k' | 'q6_k' | 'f32' | 'f16'
 
 export interface GgufTensorInfo {
   name: string
@@ -45,10 +53,14 @@ export interface HadamardConfig {
 
 export interface RopeConfig {
   theta: number
+  localTheta?: number
   type: 'normal' | 'yarn' | 'mrope'
   factor: number
   originalMaxPositions: number
   rotaryDim: number
+  yarnBetaFast?: number
+  yarnBetaSlow?: number
+  yarnTruncate?: boolean
 }
 
 export interface HybridLayerConfig {
@@ -59,8 +71,14 @@ export interface HybridLayerConfig {
   convKernel: number
 }
 
+export interface SlidingWindowConfig {
+  windowSize: number
+  pattern: number
+  layerTypes: Array<'swa' | 'full'>
+}
+
 export interface ModelArch {
-  archName: 'qwen3' | 'qwen35'
+  archName: 'qwen3' | 'qwen35' | 'plamo3'
   modelName: string
   sizeLabel: string
   layers: number
@@ -73,23 +91,32 @@ export interface ModelArch {
   maxPositions: number
   vocab: number
   eosTokenId: number
+  eomTokenId?: number
+  eotTokenId?: number
   bosTokenId?: number
   padTokenId?: number
   tieWordEmbeddings: boolean
   rope: RopeConfig
   hybrid?: HybridLayerConfig
+  swa?: SlidingWindowConfig
   hadamard?: HadamardConfig
 }
 
 export interface TokenizerData {
+  model?: 'gpt2' | 'plamo3' | string
   tokens: string[]
+  scores?: number[]
   tokenTypes?: number[]
   merges: string[]
   eosTokenId: number
+  eomTokenId?: number
+  eotTokenId?: number
   bosTokenId?: number
   padTokenId?: number
   addBosToken: boolean
   chatTemplate?: string
+  breakAroundConsecutiveSpacesThreshold?: number
+  breakAroundRepeatedCharsThreshold?: number
 }
 
 export interface ParsedGgufHeader {

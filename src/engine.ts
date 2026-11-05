@@ -1,4 +1,4 @@
-import { fetchGgufHeader, fp16ToFp32 } from './gguf.js'
+import { fetchGgufHeader, fp16ToFp32, getBlockSpec } from './gguf.js'
 import { SHADERS } from './kernels.js'
 import { sampleLogits } from './sampler.js'
 import { prefetchModel, streamModelChunks } from './storage.js'
@@ -195,18 +195,113 @@ function createBlockSplitter(
   }
 }
 
-function buildRopeTables(arch: ModelArch, maxSeqLen: number): { cos: Float32Array; sin: Float32Array } {
-  const halfDim = arch.rope.rotaryDim >> 1
+function createRawChunkStreamer(
+  device: GPUDevice,
+  chunks: QuantChunkBuffer[],
+  rowBytes: number,
+  qStage: Uint8Array<ArrayBuffer>,
+): { push: (bytes: Uint8Array) => number; finish: () => number } {
+  let chunkIdx = 0
+  let bytesInChunk = 0
+  let totalBytesInCurChunk = chunks[0].rowCount * rowBytes
+  let qStageLen = 0
+  let qGpuOffset = 0
+  const maxStage = qStage.byteLength
+
+  const flushStaging = (): number => {
+    if (qStageLen === 0) return 0
+    const c = chunks[chunkIdx]
+    const aligned = (qStageLen + 3) & ~3
+    if (aligned > qStageLen) qStage.fill(0, qStageLen, aligned)
+    device.queue.writeBuffer(c.quants, qGpuOffset, qStage, 0, aligned)
+    qGpuOffset += qStageLen
+    const written = aligned
+    qStageLen = 0
+    return written
+  }
+
+  return {
+    push: (bytes: Uint8Array): number => {
+      let flushed = 0
+      let pos = 0
+      while (pos < bytes.byteLength && chunkIdx < chunks.length) {
+        const remInChunk = totalBytesInCurChunk - bytesInChunk
+        const remInStage = maxStage - qStageLen
+        // Keep stage flushes 4-byte aligned unless completing the chunk
+        const maxAlignedStage = remInStage >= 4 ? remInStage & ~3 : remInStage
+        const take = Math.min(bytes.byteLength - pos, remInChunk, maxAlignedStage)
+        qStage.set(bytes.subarray(pos, pos + take), qStageLen)
+        qStageLen += take
+        bytesInChunk += take
+        pos += take
+
+        if (bytesInChunk === totalBytesInCurChunk) {
+          flushed += flushStaging()
+          chunkIdx++
+          bytesInChunk = 0
+          qGpuOffset = 0
+          if (chunkIdx < chunks.length) {
+            totalBytesInCurChunk = chunks[chunkIdx].rowCount * rowBytes
+          }
+        } else if (qStageLen + 4096 >= maxStage && (qStageLen & 3) === 0) {
+          flushed += flushStaging()
+        }
+      }
+      return flushed
+    },
+    finish: (): number => {
+      return flushStaging()
+    },
+  }
+}
+
+function buildRopeTables(
+  arch: ModelArch,
+  maxSeqLen: number,
+  useLocalSwa = false,
+): { cos: Float32Array; sin: Float32Array } {
+  const rotaryDim = arch.rope.rotaryDim
+  const halfDim = rotaryDim >> 1
   const cos = new Float32Array(maxSeqLen * halfDim)
   const sin = new Float32Array(maxSeqLen * halfDim)
-  const theta = arch.rope.theta
+  const theta = useLocalSwa ? (arch.rope.localTheta ?? 10000) : arch.rope.theta
+  const factor = !useLocalSwa && arch.rope.factor && arch.rope.factor > 1.0 ? arch.rope.factor : 1.0
+  const origMaxPos = arch.rope.originalMaxPositions ?? 4096
+  const betaFast = arch.rope.yarnBetaFast ?? 32.0
+  const betaSlow = arch.rope.yarnBetaSlow ?? 1.0
+  const mscale = factor > 1.0 ? 0.1 * Math.log(factor) + 1.0 : 1.0
+
+  // Precompute per-dimension inverse frequencies (supporting YaRN when factor > 1.0)
+  const invFreq = new Float64Array(halfDim)
+  let low = 0
+  let high = halfDim - 1
+  if (factor > 1.0) {
+    const findCorrDim = (numRotations: number): number =>
+      (rotaryDim * Math.log(origMaxPos / (numRotations * 2.0 * Math.PI))) / (2.0 * Math.log(theta))
+    low = Math.max(0, findCorrDim(betaFast))
+    high = Math.min(halfDim - 1, findCorrDim(betaSlow))
+    if (low === high) high += 0.001
+  }
+
+  for (let i = 0; i < halfDim; i++) {
+    const freq = 1.0 / Math.pow(theta, (2 * i) / rotaryDim)
+    if (factor > 1.0) {
+      const freqExtrap = freq
+      const freqInterp = freq / factor
+      const linear = (i - low) / (high - low)
+      const ramp = Math.min(1.0, Math.max(0.0, linear))
+      const smooth = 1.0 - ramp
+      invFreq[i] = freqInterp * (1.0 - smooth) + freqExtrap * smooth
+    } else {
+      invFreq[i] = freq
+    }
+  }
 
   for (let pos = 0; pos < maxSeqLen; pos++) {
     for (let i = 0; i < halfDim; i++) {
-      const freq = 1.0 / Math.pow(theta, (2 * i) / arch.rope.rotaryDim)
-      const angle = pos * freq
-      cos[pos * halfDim + i] = Math.cos(angle)
-      sin[pos * halfDim + i] = Math.sin(angle)
+      const angle = pos * invFreq[i]
+      cos[pos * halfDim + i] = Math.cos(angle) * mscale
+      sin[pos * halfDim + i] = Math.sin(angle) * mscale
     }
   }
   return { cos, sin }
@@ -224,6 +319,8 @@ export class HachiueEngine {
   private readonly hadamardSigns: Map<number, GPUBuffer>
   private readonly cosBuf: GPUBuffer
   private readonly sinBuf: GPUBuffer
+  private readonly swaCosBuf: GPUBuffer | null
+  private readonly swaSinBuf: GPUBuffer | null
   private readonly dummyBuf: GPUBuffer
   private readonly logitsBuf: GPUBuffer
   private readonly logitsReadBuf: GPUBuffer
@@ -262,6 +359,8 @@ export class HachiueEngine {
     hadamardSigns: Map<number, GPUBuffer>,
     cosBuf: GPUBuffer,
     sinBuf: GPUBuffer,
+    swaCosBuf: GPUBuffer | null,
+    swaSinBuf: GPUBuffer | null,
   ) {
     this.header = header
     this.arch = header.arch
@@ -273,6 +372,8 @@ export class HachiueEngine {
     this.hadamardSigns = hadamardSigns
     this.cosBuf = cosBuf
     this.sinBuf = sinBuf
+    this.swaCosBuf = swaCosBuf
+    this.swaSinBuf = swaSinBuf
 
     const mkBuf = (size: number, usage = STORAGE_COPY): GPUBuffer =>
       device.createBuffer({ size: Math.max(16, (size + 3) & ~3), usage })
@@ -303,7 +404,7 @@ export class HachiueEngine {
     const NV = hy ? hy.linearValueHeads : 1
     const DKV = hy ? hy.linearHeadDim : 1
     const valDim = hy ? NV * DKV : Hd
-    const convDim = hy ? (hy.linearKeyHeads * 2 + NV) * DKV : Hd
+    const convDim = hy ? (hy.linearKeyHeads * 2 + NV) * DKV : Math.max(Hd, qDim + 2 * kvDim)
     const maxRotDim = Math.max(Hd, F, qDim, valDim)
 
     this.scratch = {
@@ -330,7 +431,7 @@ export class HachiueEngine {
       qNormed: mkAct(PREFILL_CHUNK * qDim),
       kNormed: mkAct(PREFILL_CHUNK * kvDim),
       attOut: mkAct(PREFILL_CHUNK * qDim),
-      mlpGate: mkAct(PREFILL_CHUNK * F),
+      mlpGate: mkAct(PREFILL_CHUNK * F * (this.arch.archName === 'plamo3' ? 2 : 1)),
       mlpUp: mkAct(PREFILL_CHUNK * F),
       swigluOut: mkAct(PREFILL_CHUNK * F),
       lastHidden: mkAct(Hd),
@@ -441,15 +542,26 @@ export class HachiueEngine {
     }
 
     // Build and upload RoPE tables
-    const { cos, sin } = buildRopeTables(arch, maxSeqLen)
+    const { cos, sin } = buildRopeTables(arch, maxSeqLen, false)
     const cosBuf = device.createBuffer({ size: cos.byteLength, usage: STORAGE_COPY })
     const sinBuf = device.createBuffer({ size: sin.byteLength, usage: STORAGE_COPY })
     device.queue.writeBuffer(cosBuf, 0, cos.buffer as ArrayBuffer, cos.byteOffset, cos.byteLength)
     device.queue.writeBuffer(sinBuf, 0, sin.buffer as ArrayBuffer, sin.byteOffset, sin.byteLength)
 
+    let swaCosBuf: GPUBuffer | null = null
+    let swaSinBuf: GPUBuffer | null = null
+    if (arch.swa) {
+      const { cos: sCos, sin: sSin } = buildRopeTables(arch, maxSeqLen, true)
+      swaCosBuf = device.createBuffer({ size: sCos.byteLength, usage: STORAGE_COPY })
+      swaSinBuf = device.createBuffer({ size: sSin.byteLength, usage: STORAGE_COPY })
+      device.queue.writeBuffer(swaCosBuf, 0, sCos.buffer as ArrayBuffer, sCos.byteOffset, sCos.byteLength)
+      device.queue.writeBuffer(swaSinBuf, 0, sSin.buffer as ArrayBuffer, sSin.byteOffset, sSin.byteLength)
+    }
+
     // Allocate GPU buffers for all tensors and register stream consumers
     const maxChunkBindBytes = Math.min(device.limits.maxStorageBufferBindingSize, 64 * 1024 * 1024)
     const weights = new Map<string, GpuTensor>()
+    const dummyScalesBuf = device.createBuffer({ size: 16, usage: STORAGE_COPY })
 
     // Single shared staging buffers across all tensors (1 MiB quants + 128 KiB scales)
     const sharedQStage = new Uint8Array(new ArrayBuffer(1024 * 1024))
@@ -546,6 +658,45 @@ export class HachiueEngine {
           push: splitter.push,
           finish: splitter.finish,
         })
+      } else if (
+        t.type === GgmlType.Q4_0 ||
+        t.type === GgmlType.Q4_1 ||
+        t.type === GgmlType.Q4_K ||
+        t.type === GgmlType.Q6_K
+      ) {
+        const [blkElems, blkBytes] = getBlockSpec(t.type)
+        const nb = K / blkElems
+        const rowBytes = nb * blkBytes
+        const maxRowsPerChunk = Math.max(1, Math.floor(maxChunkBindBytes / rowBytes))
+
+        const chunks: QuantChunkBuffer[] = []
+        for (let r = 0; r < N; r += maxRowsPerChunk) {
+          const rowCount = Math.min(maxRowsPerChunk, N - r)
+          const qBytes = Math.max(16, (rowCount * rowBytes + 3) & ~3)
+          chunks.push({
+            rowStart: r,
+            rowCount,
+            quants: device.createBuffer({ size: qBytes, usage: STORAGE_COPY }),
+            scales16: dummyScalesBuf,
+          })
+        }
+
+        weights.set(t.name, {
+          type: t.type,
+          N,
+          K,
+          nb,
+          hadamardFolded,
+          chunks,
+        })
+
+        const streamer = createRawChunkStreamer(device, chunks, rowBytes, sharedQStage)
+        routes.push({
+          absStart: t.absOffset,
+          absEnd: t.absOffset + t.byteLength,
+          push: streamer.push,
+          finish: streamer.finish,
+        })
       } else {
         throw new Error(`hachiue: unsupported tensor type ${t.type} for ${t.name}`)
       }
@@ -604,7 +755,18 @@ export class HachiueEngine {
     await device.queue.onSubmittedWorkDone()
     options.onProgress?.({ phase: 'ready', message: 'Model loaded into WebGPU memory' })
 
-    return new HachiueEngine(header, device, maxSeqLen, pipelines, weights, hadamardSigns, cosBuf, sinBuf)
+    return new HachiueEngine(
+      header,
+      device,
+      maxSeqLen,
+      pipelines,
+      weights,
+      hadamardSigns,
+      cosBuf,
+      sinBuf,
+      swaCosBuf,
+      swaSinBuf,
+    )
   }
 
   /**
@@ -743,7 +905,19 @@ export class HachiueEngine {
 
     if (!w.chunks) throw new Error(`hachiue: missing quantized chunks for ${weightName}`)
     const shader =
-      w.type === GgmlType.Q1_0 ? 'gemv_q1_0' : w.type === GgmlType.PQ2_0 ? 'gemv_pq2_0' : 'gemv_ptq1_0'
+      w.type === GgmlType.Q1_0
+        ? 'gemv_q1_0'
+        : w.type === GgmlType.PQ2_0
+          ? 'gemv_pq2_0'
+          : w.type === GgmlType.PTQ1_0
+            ? 'gemv_ptq1_0'
+            : w.type === GgmlType.Q4_0
+              ? 'gemv_q4_0'
+              : w.type === GgmlType.Q4_1
+                ? 'gemv_q4_1'
+                : w.type === GgmlType.Q4_K
+                  ? 'gemv_q4_k'
+                  : 'gemv_q6_k'
 
     for (const chunk of w.chunks) {
       const groups = Math.ceil(chunk.rowCount / 4)
@@ -796,7 +970,20 @@ export class HachiueEngine {
 
     // 1. Embedding Lookup
     const embdW = this.weights.get('token_embd.weight')!
-    const embMode = embdW.type === GgmlType.Q1_0 ? 0 : embdW.type === GgmlType.PQ2_0 ? 1 : 2
+    const embMode =
+      embdW.type === GgmlType.Q1_0
+        ? 0
+        : embdW.type === GgmlType.PQ2_0
+          ? 1
+          : embdW.type === GgmlType.PTQ1_0
+            ? 2
+            : embdW.type === GgmlType.Q4_0
+              ? 3
+              : embdW.type === GgmlType.Q4_1
+                ? 4
+                : embdW.type === GgmlType.Q4_K
+                  ? 5
+                  : 6
     let curH = sc.curH
     let nextH = sc.nextH
     for (const embChunk of embdW.chunks!) {
@@ -820,6 +1007,82 @@ export class HachiueEngine {
     for (let li = 0; li < this.arch.layers; li++) {
       this.runRmsNorm(pass, curH, `blk.${li}.attn_norm.weight`, S, Hd, sc.n1)
       rotMemo.clear()
+
+      if (this.arch.archName === 'plamo3') {
+        const qDim = H * Dh
+        const kvDim = KV * Dh
+        this.runMatmul(pass, `blk.${li}.attn_qkv.weight`, sc.n1, S, sc.qkvMixed, null, rotMemo)
+        const uSplitQkv = this.mkUniform([S, qDim, kvDim, 0])
+        this.dispatch(
+          pass,
+          'split_qkv',
+          uSplitQkv,
+          [sc.qkvMixed, sc.qBuf, sc.kBuf, sc.vBuf],
+          Math.ceil((S * (qDim + 2 * kvDim)) / 256),
+        )
+
+        // Per-head Q/K RMSNorm
+        this.runRmsNorm(pass, sc.qBuf, `blk.${li}.attn_q_norm.weight`, S * H, Dh, sc.qNormed)
+        this.runRmsNorm(pass, sc.kBuf, `blk.${li}.attn_k_norm.weight`, S * KV, Dh, sc.kNormed)
+
+        // Select RoPE tables and window size depending on whether this is an SWA layer or full layer
+        const isSwa = Boolean(this.arch.swa && this.arch.swa.layerTypes[li] === 'swa')
+        const layerCosBuf = isSwa && this.swaCosBuf ? this.swaCosBuf : this.cosBuf
+        const layerSinBuf = isSwa && this.swaSinBuf ? this.swaSinBuf : this.sinBuf
+        const windowSize = isSwa && this.arch.swa ? this.arch.swa.windowSize : 0
+
+        const uRopeQ = this.mkUniform([S, H, Dh, rotDim, this.cachePos, 0, 0, 0])
+        const uRopeK = this.mkUniform([S, KV, Dh, rotDim, this.cachePos, 0, 0, 0])
+        this.dispatch(
+          pass,
+          'rope',
+          uRopeQ,
+          [layerCosBuf, layerSinBuf, sc.qNormed],
+          Math.ceil((S * H * (rotDim >> 1)) / 64),
+        )
+        this.dispatch(
+          pass,
+          'rope',
+          uRopeK,
+          [layerCosBuf, layerSinBuf, sc.kNormed],
+          Math.ceil((S * KV * (rotDim >> 1)) / 64),
+        )
+
+        // Append K and V to Q8_0 KV Cache
+        const uKv = this.mkUniform([S, KV, Dh, this.cachePos])
+        const kvBlocks = S * KV * (Dh >> 5)
+        const kQ = this.kCacheQ.get(li)!
+        const kS = this.kCacheS.get(li)!
+        const vQ = this.vCacheQ.get(li)!
+        const vS = this.vCacheS.get(li)!
+        this.dispatch(pass, 'kv_append_q8', uKv, [sc.kNormed, kQ, kS], kvBlocks)
+        this.dispatch(pass, 'kv_append_q8', uKv, [sc.vBuf, vQ, vS], kvBlocks)
+
+        // Online GQA Attention with optional Sliding Window
+        const uAtt = this.mkUniform([S, H, KV, Dh, this.cachePos, windowSize, 0, 0])
+        this.dispatch(pass, 'attention_q8', uAtt, [sc.qNormed, kQ, kS, vQ, vS, sc.attOut], S * H)
+
+        // Attention output projection -> post_attention_norm -> residual add
+        rotMemo.clear()
+        this.runMatmul(pass, `blk.${li}.attn_output.weight`, sc.attOut, S, sc.n1, null, rotMemo)
+        this.runRmsNorm(pass, sc.n1, `blk.${li}.post_attention_norm`, S, Hd, sc.n2)
+        const uAdd = this.mkUniform([S * Hd, 0, 0, 0])
+        this.dispatch(pass, 'add_inplace', uAdd, [curH, sc.n2, sc.h2], Math.ceil((S * Hd) / 256))
+
+        // FFN Norm -> Fused Gate+Up -> SwiGLU -> Down -> post_ffw_norm -> residual add
+        this.runRmsNorm(pass, sc.h2, `blk.${li}.ffn_norm.weight`, S, Hd, sc.n1)
+        rotMemo.clear()
+        this.runMatmul(pass, `blk.${li}.ffn_up.weight`, sc.n1, S, sc.mlpGate, null, rotMemo)
+        const uSwiFused = this.mkUniform([S, F, 0, 0])
+        this.dispatch(pass, 'swiglu_fused', uSwiFused, [sc.mlpGate, sc.swigluOut], Math.ceil((S * F) / 256))
+
+        rotMemo.clear()
+        this.runMatmul(pass, `blk.${li}.ffn_down.weight`, sc.swigluOut, S, sc.n1, null, rotMemo)
+        this.runRmsNorm(pass, sc.n1, `blk.${li}.post_ffw_norm`, S, Hd, sc.n2)
+        this.dispatch(pass, 'add_inplace', uAdd, [sc.h2, sc.n2, nextH], Math.ceil((S * Hd) / 256))
+        ;[curH, nextH] = [nextH, curH]
+        continue
+      }
 
       const isLinear = this.arch.hybrid && this.arch.hybrid.layerTypes[li] === 'linear'
 
@@ -1074,6 +1337,12 @@ export class HachiueEngine {
     const toPrefill = promptIds.slice(prefixMatch)
     const maxNewTokens = options.maxNewTokens ?? 512
     const stopSet = new Set<number>([this.arch.eosTokenId, ...(options.stopTokens ?? [])])
+    if (this.arch.eomTokenId !== undefined) stopSet.add(this.arch.eomTokenId)
+    if (this.arch.eotTokenId !== undefined) stopSet.add(this.arch.eotTokenId)
+    if (this.arch.archName === 'plamo3') {
+      const eomId = this.tokenizer?.tokenToId('<|plamo:eom|>')
+      if (eomId !== undefined) stopSet.add(eomId)
+    }
     const isGreedy =
       (options.temperature ?? 0.6) <= 0 && (options.repetitionPenalty === undefined || options.repetitionPenalty === 1.0)
 
@@ -1128,7 +1397,8 @@ export class HachiueEngine {
 
     if (chatInput && this.tokenizer) {
       this.lastMessages = [...chatInput.map((m) => ({ ...m })), { role: 'assistant', content: text }]
-      this.lastTurnTokens = [...promptIds, ...generatedIds, ...this.tokenizer.encode('<|im_end|>\n')]
+      const turnEndStr = this.arch.archName === 'plamo3' ? '<|plamo:eom|>' : '<|im_end|>\n'
+      this.lastTurnTokens = [...promptIds, ...generatedIds, ...this.tokenizer.encode(turnEndStr)]
     }
 
     return {

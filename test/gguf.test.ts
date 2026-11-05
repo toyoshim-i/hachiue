@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   dequantizeBlock128Cpu,
+  dequantizeBlockCpu,
   fetchGgufHeader,
   fp16ToFp32,
   fwhtBlockCpu,
@@ -93,6 +94,34 @@ describe('Quantization & Dequantization (Q1_0, PQ2_0, PTQ1_0)', () => {
       assert.equal(out[i], trits[i] * 2.0, `Mismatch at index ${i}`)
     }
   })
+
+  it('accurately decodes Q4_0 and Q4_1 32-element blocks and Q4_K / Q6_K 256-element blocks', () => {
+    // Q4_0: 18B [d: fp16=0.5 (0x3800), qs: 16B]
+    const q40 = new Uint8Array(18)
+    q40[0] = 0x00
+    q40[1] = 0x38
+    for (let i = 0; i < 16; i++) q40[2 + i] = 0x97 // low nibble 7 -> (7-8)*0.5 = -0.5, high nibble 9 -> (9-8)*0.5 = +0.5
+    const out40 = new Float32Array(32)
+    dequantizeBlockCpu(q40, GgmlType.Q4_0, out40)
+    for (let i = 0; i < 16; i++) {
+      assert.equal(out40[i], -0.5)
+      assert.equal(out40[16 + i], 0.5)
+    }
+
+    // Q4_1: 20B [d: fp16=0.5 (0x3800), m: fp16=1.0 (0x3c00), qs: 16B]
+    const q41 = new Uint8Array(20)
+    q41[0] = 0x00
+    q41[1] = 0x38
+    q41[2] = 0x00
+    q41[3] = 0x3c
+    for (let i = 0; i < 16; i++) q41[4 + i] = 0x42 // low=2 -> 2*0.5+1=2.0, high=4 -> 4*0.5+1=3.0
+    const out41 = new Float32Array(32)
+    dequantizeBlockCpu(q41, GgmlType.Q4_1, out41)
+    for (let i = 0; i < 16; i++) {
+      assert.equal(out41[i], 2.0)
+      assert.equal(out41[16 + i], 3.0)
+    }
+  })
 })
 
 describe('Fast Walsh-Hadamard Transform (FWHT-512)', () => {
@@ -170,5 +199,44 @@ describe('Live Hugging Face GGUF Header & Tokenizer Verification (Bonsai 1 & Bon
     assert.ok(header.arch.hadamard.inverseWeights.has('token_embd.weight'))
     assert.equal(header.tensors['token_embd.weight'].type, GgmlType.PTQ1_0)
     assert.equal(fp16ToFp32(0x3c00), 1.0)
+  })
+
+  it('parses plamo-3-translate-0.8b-Q4_0.gguf header and encodes/decodes PFML3 with Unigram DP', async () => {
+    const url = 'https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf'
+    const header = await fetchGgufHeader(url)
+    assert.equal(header.arch.archName, 'plamo3')
+    assert.equal(header.arch.layers, 16)
+    assert.equal(header.arch.hidden, 1536)
+    assert.equal(header.arch.intermediate, 6144)
+    assert.equal(header.arch.heads, 16)
+    assert.equal(header.arch.kvHeads, 1)
+    assert.equal(header.arch.vocab, 107520)
+    assert.equal(header.arch.tieWordEmbeddings, false)
+    assert.ok(header.arch.swa)
+    assert.equal(header.arch.swa.windowSize, 2048)
+    assert.equal(header.arch.swa.pattern, 8)
+    assert.equal(header.arch.swa.layerTypes[0], 'swa')
+    assert.equal(header.arch.swa.layerTypes[7], 'full')
+    assert.equal(header.arch.swa.layerTypes[15], 'full')
+    assert.equal(header.tensors['token_embd.weight'].type, GgmlType.Q4_0)
+    assert.equal(header.tensors['output.weight'].type, GgmlType.Q6_K)
+    assert.equal(header.tensors['blk.0.post_attention_norm'].type, GgmlType.F32)
+    assert.ok(header.tokenizer)
+    assert.equal(header.tokenizer.model, 'plamo3')
+
+    const tok = new GgufTokenizer(header.tokenizer)
+    const prompt = tok.formatChat([{ role: 'user', content: 'Hello, world!\nThis is PLaMo 3 Translate.' }], {
+      sourceLang: 'en',
+      targetLang: 'ja',
+    })
+    assert.ok(prompt.startsWith('<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation'))
+    const ids = tok.encode(prompt)
+    assert.equal(ids[0], 1) // <|plamo:bos|>
+    assert.equal(ids[1], 16) // <|plamo:tag|>
+    assert.equal(tok.decode(ids, false), prompt)
+
+    const textOnly = 'こんにちは、世界！ Today is 2026-11-05.   Multiple   spaces and aaaaa.'
+    const textIds = tok.encode(textOnly)
+    assert.equal(tok.decode(textIds, true), textOnly)
   })
 })
