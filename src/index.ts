@@ -22,6 +22,24 @@ export {
   streamModelChunks,
 } from './storage.js'
 export { GgufTokenizer } from './tokenizer.js'
+export {
+  buildInstructTermMessages,
+  buildInstructTextMessages,
+  buildPlamo3TranslationPrompt,
+  extractCleanTermTranslation,
+  extractCleanTextTranslation,
+  type GlossaryEntry,
+  isValidTargetLanguageTranslation,
+  normalizeLangCode,
+  stripModelReasoningAndTags,
+  type TranslateTermOptions,
+  type TranslateTextOptions,
+  type TranslationHistoryEntry,
+  type TranslationLangCode,
+  type TranslationResult,
+  translateTerm,
+  translateText,
+} from './translate.js'
 export type {
   ChatMessage,
   EngineOptions,

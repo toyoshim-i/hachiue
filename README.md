@@ -1,45 +1,51 @@
 # 🪴 hachiue (鉢植え)
 
-Zero-dependency, mobile-optimized WebGPU inference engine for **PrismML Bonsai 1 (1-bit `Q1_0` / Ternary `PQ2_0`)** and **Bonsai 2 (Ternary 1.58-bit `PTQ1_0` / `PQ2_0`)** GGUF models.
+Zero-dependency, mobile-optimized WebGPU LLM & translation inference engine supporting:
+- **Tier 1 (Core WebGPU LLM Engine)**:
+  - **PrismML Bonsai 1** (`qwen3` dense GQA, 1-bit `Q1_0` and ternary `PQ2_0`).
+  - **PrismML Bonsai 2** (`qwen35` 3:1 Gated DeltaNet hybrid linear attention + Hadamard-rotated ternary `PTQ1_0` / `PQ2_0`).
+  - **PFN PLaMo 3 Translate** (`plamo3` 0.8B / 2B, Sliding Window Attention + YaRN RoPE + Unigram DP tokenizer, standard GGML `Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`).
+- **Tier 2 (Model-Agnostic Translation Helpers)**:
+  - `translateText(engine, options)`: Sentence, paragraph, and multi-line document translation with optional `context`, `glossary`, `form` (`'polite' | 'plain'`), and multi-turn `history`.
+  - `translateTerm(engine, options)`: Concise dictionary / short-phrase lookup with optional `context` disambiguation and automatic fallback.
 
-👉 **[Live Demo (GitHub Pages)](https://toyoshim-i.github.io/hachiue/)**
+👉 **[Live Demo — Translate & Chat (GitHub Pages)](https://toyoshim-i.github.io/hachiue/)**
 
 ## Key Features
 
 - **GGUF Direct (Zero Offline Conversion)**:
-  - Point `HachiueEngine.create({ url })` directly at any `.gguf` URL on Hugging Face.
-  - Includes a zero-dependency GGUF v3 parser and embedded BPE tokenizer extracted straight from the GGUF header.
+  - Point `HachiueEngine.create({ url })` directly at any supported `.gguf` URL on Hugging Face.
+  - Includes a zero-dependency GGUF v3 parser plus both GPT-2/Qwen BPE and PLaMo-3 Aho-Corasick / Unigram Trie DP tokenizers extracted straight from the GGUF header.
 - **Double-Buffered Mobile Streaming & Resumable Cache**:
   - Replaces `Response.clone()` and monolithic `CacheStorage.put()` with bounded **16 MiB HTTP `Range` requests** persisted chunk-by-chunk to **OPFS (Origin Private File System)** (with automatic IndexedDB chunk fallback on iOS WebKit).
   - Uses a **2-slot double-buffered pipeline** that overlaps downloading chunk `N + 1` with writing chunk `N` to local cache and uploading tensors to WebGPU (peak chunk RAM $\le$ 32 MiB).
-  - Enforces WebGPU queue backpressure (`await device.queue.onSubmittedWorkDone()`) and macrotask GC yields every 16 MiB so iOS Jetsam limits are never exceeded—even when loading 1.1 GB 4B models on an iPhone.
-- **Zero-Inflation Planar VRAM Layout & Zero-Allocation Runtime**:
-  - Keeps `Q1_0` (18B / 128 weights), `PTQ1_0` (28B / 128 weights), and `PQ2_0` (34B / 128 weights) at their exact native GGUF footprint in GPU memory.
-  - Packs `fp16` block scales into `u32` pairs unpacked via WGSL `unpack2x16float` (saving ~11% VRAM without requiring `shader-f16`).
+  - Enforces WebGPU queue backpressure (`await device.queue.onSubmittedWorkDone()`) and macrotask GC yields every 16 MiB so iOS Jetsam limits are never exceeded.
+- **Zero-Inflation VRAM Layout & Zero-Allocation Runtime**:
+  - Keeps both PrismML ultra-low-bit formats (`Q1_0`, `PTQ1_0`, `PQ2_0`) and standard GGML formats (`Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`) at their exact native GGUF footprint in GPU memory.
   - Shares `token_embd.weight` and `output.weight` (`lm_head`) GPU buffers when `tie_word_embeddings` is enabled, and automatically splits large tensors across `64 MiB` storage buffer chunks.
-  - Reuses a single `1.125 MiB` CPU staging buffer pair during loading and a pre-allocated `~2.8 MiB` GPU scratch buffer pool during inference (**zero dynamic GPU/CPU buffer allocations per token**).
-- **Full Bonsai 1 & Bonsai 2 Architecture Support**:
-  - Multi-row (`ROWS_PER_WG = 4`) WGSL compute kernels for `Q1_0`, `PTQ1_0` (base-3 dense trits), and `PQ2_0` (2-bit ternary slots).
-  - Workgroup-shared Fast Walsh-Hadamard Transform (`hadamard_512`) and grouped head permutation (`permute_gdn`) for `prism.hadamard` folded weights and latent embeddings.
-  - **Qwen3** dense GQA attention (`Q8_0` KV cache) and **Qwen3.5** Hybrid Attention (3:1 Gated DeltaNet recurrent linear attention + gated full attention), with automatic multi-turn prefix reuse for both KV cache and Gated DeltaNet recurrent state.
+  - Reuses a single `1.125 MiB` CPU staging buffer pair during loading and a pre-allocated GPU scratch buffer pool during inference (**zero dynamic GPU/CPU buffer allocations per token**).
+- **Tier 2 Translation Helpers (`translateText` & `translateTerm`)**:
+  - Absorbs prompt templates (PFML3 `<|plamo:tag|>` vs ChatML `<|im_start|>`), stop tokens, language code normalization, reasoning tag stripping, and target script validation across PLaMo 3 Translate and Bonsai 1 / 2.
 
 ## Supported Models & Benchmarks
 
 ### Model Lineup & Measured Speed (`hachiue` WebGPU)
 
-| Model | Base Arch | Format | bpw | File Size | iPhone 17 Pro Max (Chrome) |
+| Model | Base Arch | Format | bpw | File Size | Speed |
 | :--- | :--- | :--- | ---: | ---: | :--- |
-| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(prefill 187 ms)* |
-| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | **42.0 tok/s** *(prefill 228 ms)* |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | **25.4 tok/s** *(prefill 417 ms)* |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | **44.2 tok/s** *(prefill 243 ms)* |
-| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | **30.7 tok/s** *(prefill 339 ms)* |
-| **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | **28.9 tok/s** *(prefill 451 ms)* |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | **13.3 tok/s** *(prefill 836 ms)* |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* |
-| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | **26.4 tok/s** *(prefill 478 ms)* |
-
-*Measured on a single-turn `"hello"` prompt (13 prompt tokens).*
+| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **522 MiB** | **~85 tok/s** *(M-series Mac)* |
+| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.5 | **546 MiB** | **~80 tok/s** *(M-series Mac)* |
+| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **1,620 MiB** | Dedicated high-accuracy translation |
+| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.6 | **1,723 MiB** | Dedicated high-accuracy translation |
+| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(iPhone 17 Pro Max)* |
+| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | **42.0 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | **25.4 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | **44.2 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | **30.7 tok/s** *(iPhone 17 Pro Max)* |
+| **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | **28.9 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | **13.3 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | **26.4 tok/s** *(iPhone 17 Pro Max)* |
 
 ### Published Quality Benchmarks
 
@@ -79,40 +85,57 @@ npm install hachiue
 Or import directly in the browser via CDN (zero build step):
 ```html
 <script type="module">
-  import { HachiueEngine, prefetchModel } from 'https://cdn.jsdelivr.net/npm/hachiue/+esm';
+  import { HachiueEngine, translateText, translateTerm } from 'https://cdn.jsdelivr.net/npm/hachiue/+esm';
 </script>
 ```
+
+### Tier 1: Generic LLM Inference (`HachiueEngine`)
 
 ```ts
 import { HachiueEngine, prefetchModel } from 'hachiue';
 
 const engine = await HachiueEngine.create({
-  url: 'https://huggingface.co/prism-ml/Ternary-Bonsai-2-2B-gguf/resolve/main/Ternary-Bonsai-2-2B-PTQ1_0.gguf',
+  url: 'https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf',
   onProgress: (p) => {
     if (p.totalBytes) console.log(`${p.phase}: ${(p.loadedBytes / 1048576).toFixed(1)} MiB`);
   },
 });
 
-// Optional: prefetch another model into OPFS / IndexedDB in the background while chatting
-prefetchModel(
-  'https://huggingface.co/prism-ml/Ternary-Bonsai-2-4B-gguf/resolve/main/Ternary-Bonsai-2-4B-PQ2_0.gguf',
+const reply = await engine.generate(
+  [{ role: 'user', content: 'Small trees thrive in small pots.' }],
   {
-    onProgress: (p) => {
-      if (p.totalBytes) console.log(`Prefetch: ${((p.loadedBytes / p.totalBytes) * 100).toFixed(1)}%`);
-    },
+    maxNewTokens: 256,
+    temperature: 0,
+    onToken: (_id, delta) => process.stdout.write(delta),
   },
 );
+```
 
-const result = await engine.generate({
-  messages: [
-    { role: 'user', content: 'Translate into Japanese: Small trees thrive in small pots.' },
-  ],
-  maxNewTokens: 256,
-  temperature: 0.7,
-  onToken: (_id, text) => process.stdout.write(text),
+### Tier 2: Model-Agnostic Translation Helpers (`translateText` & `translateTerm`)
+
+Works seamlessly across **PLaMo 3 Translate** (`plamo3`), **Bonsai 1** (`qwen3`), and **Bonsai 2** (`qwen35`):
+
+```ts
+import { HachiueEngine, translateText, translateTerm } from 'hachiue';
+
+// 1. Document / Sentence Translation
+const docResult = await translateText(engine, {
+  text: 'Small trees thrive in small pots.',
+  sourceLang: 'en',
+  targetLang: 'ja',
+  form: 'polite', // 'polite' (です・ます) | 'plain' (だ・である)
+  glossary: [{ source: 'pots', target: '植木鉢' }],
 });
+console.log(docResult.translation);
 
-console.log(`\nSpeed: ${result.decodeTokensPerSec.toFixed(1)} tok/s (prefill ${result.prefillMs.toFixed(0)} ms)`);
+// 2. Word / Short-Phrase Dictionary Lookup with Optional Context
+const termResult = await translateTerm(engine, {
+  term: 'bank',
+  context: 'The river bank was overflowing after the heavy rain.',
+  sourceLang: 'en',
+  targetLang: 'ja',
+});
+console.log(termResult.translation); // -> "岸辺" (PLaMo 3) / "川岸" (Bonsai 2)
 ```
 
 ## Development & Testing
@@ -120,7 +143,7 @@ console.log(`\nSpeed: ${result.decodeTokensPerSec.toFixed(1)} tok/s (prefill ${r
 ```bash
 npm install
 npm run build
-npm test              # Unit tests (quantization, FWHT-512, GGUF parser, Range loader)
+npm test              # Unit tests (quantization, FWHT-512, GGUF parser, tokenizers, translation helpers)
 npm run test:webgpu   # Headless Chrome WebGPU kernel & pipeline tests
 ```
 

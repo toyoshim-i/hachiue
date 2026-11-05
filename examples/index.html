@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>hachiue (鉢植え) — Mobile WebGPU Bonsai 1 & 2 Runtime</title>
+  <title>hachiue (鉢植え) — Mobile WebGPU LLM & Translation Runtime</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -85,7 +85,7 @@
       flex: 1;
       justify-content: flex-end;
     }
-    select, button, input {
+    select, button, input, textarea {
       font: inherit;
       padding: 7px 12px;
       border-radius: 8px;
@@ -93,12 +93,12 @@
       background: var(--bg);
       color: var(--fg);
     }
+    button { cursor: pointer; }
     button.primary {
       background: var(--accent);
       color: var(--accent-fg);
       border-color: transparent;
       font-weight: 600;
-      cursor: pointer;
     }
     button.primary:hover:not(:disabled) { background: var(--accent-hover); }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -125,7 +125,42 @@
       background: var(--accent);
       transition: width 0.15s ease;
     }
-    main {
+    .mode-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 8px 16px 0;
+      background: var(--card);
+      border-bottom: 1px solid var(--line);
+      max-width: 100%;
+    }
+    .mode-tab {
+      padding: 7px 16px;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 8px 8px 0 0;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 14px;
+      position: relative;
+      bottom: -1px;
+    }
+    .mode-tab.active {
+      background: var(--bg);
+      color: var(--fg);
+      border-color: var(--line);
+      border-bottom-color: var(--bg);
+    }
+    .view-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .view-panel.hidden {
+      display: none !important;
+    }
+    main#chatBox {
       flex: 1;
       overflow-y: auto;
       padding: 16px;
@@ -201,13 +236,100 @@
       margin: 0 auto;
     }
     footer input { flex: 1; }
+
+    /* Translate Panel Styles */
+    .translate-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      max-width: 860px;
+      width: 100%;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .trans-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .trans-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .submode-toggle {
+      display: inline-flex;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 2px;
+      gap: 2px;
+    }
+    .submode-btn {
+      border: 0;
+      background: transparent;
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .submode-btn.active {
+      background: var(--card);
+      color: var(--fg);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }
+    .lang-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .field-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    textarea.trans-textarea {
+      width: 100%;
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+    .trans-output {
+      min-height: 90px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .opt-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px;
+    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand">
       🪴 hachiue
-      <span style="font-weight:400;font-size:13px;color:var(--muted)">Mobile WebGPU Bonsai 1 & 2</span>
+      <span style="font-weight:400;font-size:13px;color:var(--muted)">Mobile WebGPU LLM & Translation</span>
       <a class="gh-link" href="https://github.com/toyoshim-i/hachiue" target="_blank" rel="noopener noreferrer" title="View source on GitHub">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
         GitHub
@@ -215,8 +337,14 @@
     </div>
     <div class="controls">
       <select id="modelSelect">
+        <optgroup label="PLaMo 3 Translate (PFN Dedicated Translation)">
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf">PLaMo 3 Translate 0.8B Q4_0 (522 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_K_M.gguf">PLaMo 3 Translate 0.8B Q4_K_M (546 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_0.gguf">PLaMo 3 Translate 2B Q4_0 (1,620 MiB)</option>
+          <option value="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/main/plamo-3-translate-2b-Q4_K_M.gguf">PLaMo 3 Translate 2B Q4_K_M (1,723 MiB)</option>
+        </optgroup>
         <optgroup label="Bonsai 1 (Binary 1-bit Q1_0)">
-          <option value="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf">Bonsai 1.7B Q1_0 (237 MiB)</option>
+          <option value="https://huggingface.co/prism-ml/Bonsai-1.7B-gguf/resolve/main/Bonsai-1.7B-Q1_0.gguf" selected>Bonsai 1.7B Q1_0 (237 MiB)</option>
           <option value="https://huggingface.co/prism-ml/Bonsai-4B-gguf/resolve/main/Bonsai-4B-Q1_0.gguf">Bonsai 4B Q1_0 (546 MiB)</option>
           <option value="https://huggingface.co/prism-ml/Bonsai-8B-gguf/resolve/main/Bonsai-8B-Q1_0.gguf">Bonsai 8B Q1_0 (1,105 MiB)</option>
         </optgroup>
@@ -233,13 +361,13 @@
       </select>
       <button id="loadBtn" class="primary">Load Model</button>
       <button id="prefetchBtn" title="Download selected model into browser cache in the background while keeping the current model active">Prefetch</button>
-      <button id="clearChatBtn" disabled title="Reset conversation history and KV/recurrent cache">Clear Chat</button>
+      <button id="clearChatBtn" disabled title="Reset conversation history and KV/recurrent cache">Reset Cache</button>
     </div>
   </header>
 
   <div class="status-bar">
     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
-      <div id="statusText">Select a Bonsai 1 or Bonsai 2 model and tap "Load Model".</div>
+      <div id="statusText">Select a PLaMo 3 Translate or Bonsai model and tap "Load Model".</div>
       <div id="storageRow" style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;">
         <span id="prefetchStatus" style="color:var(--accent);"></span>
         <span id="storageUsage"></span>
@@ -249,15 +377,107 @@
     <div class="progress-wrap" id="progWrap"><div class="progress-bar" id="progBar"></div></div>
   </div>
 
-  <main id="chatBox"></main>
+  <div class="mode-tabs">
+    <button id="tabTranslate" class="mode-tab active">🌐 Translate (Text & Term)</button>
+    <button id="tabChat" class="mode-tab">💬 Chat</button>
+  </div>
 
-  <footer>
-    <input id="promptInput" type="text" placeholder="Type a message..." disabled />
-    <button id="sendBtn" class="primary" disabled>Send</button>
-  </footer>
+  <!-- Translate View -->
+  <div id="translatePanel" class="view-panel">
+    <div class="translate-container">
+      <div class="trans-card">
+        <div class="trans-header">
+          <div class="submode-toggle" role="tablist">
+            <button id="submodeTextBtn" class="submode-btn active" type="button">📄 Document / Sentence (translateText)</button>
+            <button id="submodeTermBtn" class="submode-btn" type="button">📖 Word / Phrase Lookup (translateTerm)</button>
+          </div>
+          <div class="lang-bar">
+            <label class="field-label" for="srcLangSelect">From</label>
+            <select id="srcLangSelect">
+              <option value="en" selected>English (en)</option>
+              <option value="ja">Japanese (ja)</option>
+              <option value="zh-CN">Chinese Simplified (zh-CN)</option>
+              <option value="zh-TW">Chinese Traditional (zh-TW)</option>
+              <option value="ko">Korean (ko)</option>
+              <option value="es">Spanish (es)</option>
+              <option value="fr">French (fr)</option>
+              <option value="de">German (de)</option>
+            </select>
+            <span style="color:var(--muted)">→</span>
+            <label class="field-label" for="tgtLangSelect">To</label>
+            <select id="tgtLangSelect">
+              <option value="ja" selected>Japanese (日本語)</option>
+              <option value="ja-easy">Easy Japanese (やさしい日本語)</option>
+              <option value="en">English</option>
+              <option value="zh-CN">Chinese Simplified (简体中文)</option>
+              <option value="zh-TW">Chinese Traditional (繁體中文)</option>
+              <option value="ko">Korean (한국어)</option>
+              <option value="es">Spanish (Español)</option>
+              <option value="fr">French (Français)</option>
+              <option value="de">German (Deutsch)</option>
+            </select>
+            <select id="formSelect" title="Japanese style (Polite vs Plain)">
+              <option value="">Style: Auto</option>
+              <option value="polite">Polite (です・ます)</option>
+              <option value="plain">Plain (だ・である)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Text Mode Inputs -->
+        <div id="textInputsWrap" class="field-group">
+          <label class="field-label" for="transTextInput">Source Text</label>
+          <textarea id="transTextInput" class="trans-textarea" placeholder="Enter sentences or paragraphs to translate...">Small trees thrive in small pots. With 1-bit and 4-bit quantization on WebGPU, language models run directly inside mobile browsers.</textarea>
+        </div>
+
+        <!-- Term Mode Inputs -->
+        <div id="termInputsWrap" class="field-group" style="display:none;">
+          <label class="field-label" for="transTermInput">Target Word or Short Phrase</label>
+          <input id="transTermInput" type="text" value="bank" placeholder="e.g. bank, spring, extract vital cues" />
+        </div>
+
+        <div class="opt-grid">
+          <div class="field-group">
+            <label class="field-label" for="transContextInput">Optional Context (surrounding sentence or domain note)</label>
+            <input id="transContextInput" type="text" placeholder="e.g. The river bank was overflowing after heavy rain." />
+          </div>
+          <div id="glossaryGroup" class="field-group">
+            <label class="field-label" for="transGlossaryInput">Optional Glossary (`source=target`, comma-separated)</label>
+            <input id="transGlossaryInput" type="text" placeholder="e.g. pots=植木鉢, quantization=量子化" />
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;gap:8px;align-items:center;">
+          <button id="runTransBtn" class="primary" disabled>Translate</button>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Translation Output</label>
+          <div id="transOutputBox" class="trans-output"></div>
+          <div id="transStatsBox" class="stats"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chat View -->
+  <div id="chatPanel" class="view-panel hidden">
+    <main id="chatBox"></main>
+    <footer>
+      <input id="promptInput" type="text" placeholder="Type a message..." disabled />
+      <button id="sendBtn" class="primary" disabled>Send</button>
+    </footer>
+  </div>
 
   <script type="module">
-    import { HachiueEngine, clearModelCache, getCachedModelSize, prefetchModel } from '../dist/index.js'
+    import {
+      HachiueEngine,
+      clearModelCache,
+      getCachedModelSize,
+      prefetchModel,
+      translateTerm,
+      translateText,
+    } from '../dist/index.js'
 
     const modelSelect = document.getElementById('modelSelect')
     const loadBtn = document.getElementById('loadBtn')
@@ -269,6 +489,31 @@
     const statusText = document.getElementById('statusText')
     const progWrap = document.getElementById('progWrap')
     const progBar = document.getElementById('progBar')
+
+    // Mode tabs
+    const tabTranslate = document.getElementById('tabTranslate')
+    const tabChat = document.getElementById('tabChat')
+    const translatePanel = document.getElementById('translatePanel')
+    const chatPanel = document.getElementById('chatPanel')
+
+    // Translate UI elements
+    const submodeTextBtn = document.getElementById('submodeTextBtn')
+    const submodeTermBtn = document.getElementById('submodeTermBtn')
+    const textInputsWrap = document.getElementById('textInputsWrap')
+    const termInputsWrap = document.getElementById('termInputsWrap')
+    const glossaryGroup = document.getElementById('glossaryGroup')
+    const srcLangSelect = document.getElementById('srcLangSelect')
+    const tgtLangSelect = document.getElementById('tgtLangSelect')
+    const formSelect = document.getElementById('formSelect')
+    const transTextInput = document.getElementById('transTextInput')
+    const transTermInput = document.getElementById('transTermInput')
+    const transContextInput = document.getElementById('transContextInput')
+    const transGlossaryInput = document.getElementById('transGlossaryInput')
+    const runTransBtn = document.getElementById('runTransBtn')
+    const transOutputBox = document.getElementById('transOutputBox')
+    const transStatsBox = document.getElementById('transStatsBox')
+
+    // Chat UI elements
     const chatBox = document.getElementById('chatBox')
     const promptInput = document.getElementById('promptInput')
     const sendBtn = document.getElementById('sendBtn')
@@ -279,11 +524,44 @@
     let abortCtrl = null
     let prefetchCtrl = null
     let prefetchPromise = null
+    let translateSubmode = 'text' // 'text' | 'term'
     const cachedUrls = new Set()
+
+    tabTranslate.onclick = () => {
+      tabTranslate.classList.add('active')
+      tabChat.classList.remove('active')
+      translatePanel.classList.remove('hidden')
+      chatPanel.classList.add('hidden')
+    }
+    tabChat.onclick = () => {
+      tabChat.classList.add('active')
+      tabTranslate.classList.remove('active')
+      chatPanel.classList.remove('hidden')
+      translatePanel.classList.add('hidden')
+    }
+
+    submodeTextBtn.onclick = () => {
+      translateSubmode = 'text'
+      submodeTextBtn.classList.add('active')
+      submodeTermBtn.classList.remove('active')
+      textInputsWrap.style.display = ''
+      termInputsWrap.style.display = 'none'
+      glossaryGroup.style.display = ''
+    }
+    submodeTermBtn.onclick = () => {
+      translateSubmode = 'term'
+      submodeTermBtn.classList.add('active')
+      submodeTextBtn.classList.remove('active')
+      textInputsWrap.style.display = 'none'
+      termInputsWrap.style.display = ''
+      glossaryGroup.style.display = 'none'
+      if (!transContextInput.value) {
+        transContextInput.value = 'The river bank was overflowing after the heavy rain.'
+      }
+    }
 
     const fmtBytes = (b) => b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : `${(b / 1e6).toFixed(0)} MB`
 
-    // Minimal XSS-safe streaming Markdown renderer (matches bitgpu chat.html)
     const escHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     const inlineMd = (s) => {
       const codes = []
@@ -478,8 +756,7 @@
       messages = []
       engine?.resetCache()
       chatBox.innerHTML = ''
-      statusText.textContent = 'Chat cleared — the model forgot the conversation (KV & recurrent cache reset).'
-      promptInput.focus()
+      statusText.textContent = 'KV & recurrent cache reset.'
     }
 
     clearCacheBtn.onclick = async () => {
@@ -504,6 +781,7 @@
       prefetchBtn.disabled = true
       modelSelect.disabled = true
       clearChatBtn.disabled = true
+      runTransBtn.disabled = true
       progWrap.style.display = 'block'
       progBar.style.width = '0%'
 
@@ -535,8 +813,8 @@
         statusText.textContent = `Ready: ${engine.arch.modelName} (${engine.arch.archName}, ${engine.arch.layers}L, vocab=${engine.arch.vocab})`
         promptInput.disabled = false
         sendBtn.disabled = false
+        runTransBtn.disabled = false
         clearChatBtn.disabled = false
-        promptInput.focus()
         await refreshCacheBadges()
       } catch (err) {
         progWrap.style.display = 'none'
@@ -548,6 +826,88 @@
         updatePrefetchBtnState()
       }
     }
+
+    function parseGlossaryInput(raw) {
+      if (!raw || !raw.trim()) return undefined
+      const entries = []
+      for (const part of raw.split(',')) {
+        const eq = part.indexOf('=')
+        if (eq > 0) {
+          const source = part.slice(0, eq).trim()
+          const target = part.slice(eq + 1).trim()
+          if (source && target) entries.push({ source, target })
+        }
+      }
+      return entries.length > 0 ? entries : undefined
+    }
+
+    async function runTranslation() {
+      if (busy) {
+        abortCtrl?.abort()
+        return
+      }
+      if (!engine) return
+      busy = true
+      abortCtrl = new AbortController()
+      runTransBtn.textContent = 'Stop'
+      transOutputBox.textContent = ''
+      transStatsBox.textContent = ''
+
+      let streamed = ''
+      try {
+        let res
+        if (translateSubmode === 'term') {
+          const term = transTermInput.value.trim()
+          if (!term) return
+          res = await translateTerm(engine, {
+            term,
+            sourceLang: srcLangSelect.value,
+            targetLang: tgtLangSelect.value,
+            context: transContextInput.value.trim() || undefined,
+            signal: abortCtrl.signal,
+            onToken: (_id, delta) => {
+              streamed += delta
+              transOutputBox.textContent = streamed
+            },
+          })
+        } else {
+          const text = transTextInput.value.trim()
+          if (!text) return
+          res = await translateText(engine, {
+            text,
+            sourceLang: srcLangSelect.value,
+            targetLang: tgtLangSelect.value,
+            context: transContextInput.value.trim() || undefined,
+            glossary: parseGlossaryInput(transGlossaryInput.value),
+            form: formSelect.value || undefined,
+            signal: abortCtrl.signal,
+            onToken: (_id, delta) => {
+              streamed += delta
+              transOutputBox.textContent = streamed
+            },
+          })
+        }
+        transOutputBox.textContent = res.translation
+        const ctxNote = res.usedContext ? ' · context applied' : ''
+        transStatsBox.textContent =
+          `${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
+          (res.stats.reusedCache ? ' · cache reused' : '') +
+          ctxNote
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          transOutputBox.textContent = `${streamed} [stopped]`
+        } else {
+          transOutputBox.textContent = `[Error: ${err.message || err}]`
+          console.error(err)
+        }
+      } finally {
+        busy = false
+        abortCtrl = null
+        runTransBtn.textContent = 'Translate'
+      }
+    }
+
+    runTransBtn.onclick = runTranslation
 
     async function sendMessage() {
       if (busy) {

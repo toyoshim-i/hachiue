@@ -1,13 +1,20 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  buildInstructTermMessages,
+  buildInstructTextMessages,
+  buildPlamo3TranslationPrompt,
   dequantizeBlock128Cpu,
   dequantizeBlockCpu,
+  extractCleanTermTranslation,
+  extractCleanTextTranslation,
   fetchGgufHeader,
   fp16ToFp32,
   fwhtBlockCpu,
   GgmlType,
   GgufTokenizer,
+  isValidTargetLanguageTranslation,
+  normalizeLangCode,
 } from '../src/index.js'
 
 describe('Quantization & Dequantization (Q1_0, PQ2_0, PTQ1_0)', () => {
@@ -238,5 +245,61 @@ describe('Live Hugging Face GGUF Header & Tokenizer Verification (Bonsai 1 & Bon
     const textOnly = 'こんにちは、世界！ Today is 2026-11-05.   Multiple   spaces and aaaaa.'
     const textIds = tok.encode(textOnly)
     assert.equal(tok.decode(textIds, true), textOnly)
+  })
+})
+
+describe('Tier 2 Translation Helpers (PFML3 & ChatML Builders, Cleansing, Validation)', () => {
+  it('builds PFML3 prompts with context, glossary, history, and politeness form for plamo3', () => {
+    const prompt = buildPlamo3TranslationPrompt({
+      input: 'Hachiue runs on WebGPU.',
+      sourceLang: 'en',
+      targetLang: 'ja',
+      context: 'Technical documentation for a browser inference engine.',
+      glossary: [{ source: 'Hachiue', target: '鉢植え' }],
+      form: 'polite',
+      history: [{ source: 'Hello.', translation: 'こんにちは。' }],
+    })
+    assert.equal(
+      prompt,
+      '<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation' +
+        '<|plamo:tag|>context<|plamo:msg|>Technical documentation for a browser inference engine.' +
+        '<|plamo:tag|>glossary<|plamo:msg|>Hachiue\t鉢植え' +
+        '<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Hello.' +
+        '<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>こんにちは。' +
+        '<|plamo:tag|>input<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>Hachiue runs on WebGPU.' +
+        '<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:key|>form<|plamo:val|>Polite<|plamo:msg|>',
+    )
+  })
+
+  it('normalizes language codes and validates target language scripts', () => {
+    assert.equal(normalizeLangCode('zh-CN').plamoCode, 'zh-Hans')
+    assert.equal(normalizeLangCode('zh-TW').plamoCode, 'zh-Hant')
+    assert.equal(normalizeLangCode('ja').englishName, 'Japanese')
+
+    assert.equal(isValidTargetLanguageTranslation('川岸、土手', 'bank', 'ja'), true)
+    assert.equal(isValidTargetLanguageTranslation('bank', 'bank', 'ja'), false)
+    assert.equal(isValidTargetLanguageTranslation('river edge', 'bank', 'ja'), false)
+    assert.equal(isValidTargetLanguageTranslation('河岸', 'bank', 'zh-CN'), true)
+    assert.equal(isValidTargetLanguageTranslation('강둑', 'bank', 'ko'), true)
+  })
+
+  it('cleanses thinking tags and dictionary prefixes from raw model outputs', () => {
+    assert.equal(extractCleanTermTranslation('<think>\nthinking...\n</think>\n"bank" → 銀行、川岸\nExtra line'), '銀行、川岸')
+    assert.equal(extractCleanTextTranslation('<think></think>\n翻訳: こんにちは。\n元気ですか？<|plamo:eom|>'), 'こんにちは。\n元気ですか？')
+
+    const msgWithCtx = buildInstructTermMessages('bank', 'ja', 'The river bank was overflowing.')
+    assert.equal(msgWithCtx.length, 2)
+    assert.ok(msgWithCtx[1].content.includes('Context: "The river bank was overflowing."'))
+
+    const docMsgs = buildInstructTextMessages({
+      text: 'Small trees thrive in small pots.',
+      sourceLang: 'en',
+      targetLang: 'ja',
+      form: 'plain',
+      glossary: [{ source: 'pots', target: '鉢' }],
+    })
+    assert.equal(docMsgs.length, 2)
+    assert.ok(docMsgs[0].content.includes('だ・である調'))
+    assert.ok(docMsgs[0].content.includes('"pots" -> "鉢"'))
   })
 })
