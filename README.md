@@ -31,21 +31,21 @@ Zero-dependency, mobile-optimized WebGPU LLM & translation inference engine supp
 
 ### Model Lineup & Measured Speed (`hachiue` WebGPU)
 
-| Model | Base Arch | Format | bpw | File Size | Speed |
+| Model | Base Arch | Format | bpw | File Size | iPhone 17 Pro Max (Chrome) |
 | :--- | :--- | :--- | ---: | ---: | :--- |
-| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **522 MiB** | **~85 tok/s** *(M-series Mac)* |
-| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.5 | **546 MiB** | **~80 tok/s** *(M-series Mac)* |
-| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **1,620 MiB** | Dedicated high-accuracy translation |
-| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.6 | **1,723 MiB** | Dedicated high-accuracy translation |
-| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(iPhone 17 Pro Max)* |
-| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | **42.0 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | **25.4 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | **44.2 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | **30.7 tok/s** *(iPhone 17 Pro Max)* |
-| **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | **28.9 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | **13.3 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(iPhone 17 Pro Max)* |
-| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | **26.4 tok/s** *(iPhone 17 Pro Max)* |
+| **Bonsai 1.7B** | Qwen3-1.7B | `Q1_0` (1-bit) | 1.125 | **237 MiB** | **51.0 tok/s** *(prefill 187 ms)* |
+| **Ternary Bonsai 1.7B** | Qwen3-1.7B | `PQ2_0` (Ternary) | 2.125 | **420 MiB** | **42.0 tok/s** *(prefill 228 ms)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PTQ1_0` (Ternary) | 1.750 | **406 MiB** | **25.4 tok/s** *(prefill 417 ms)* |
+| **Bonsai 2 2B** | Qwen3.5-2B | `PQ2_0` (Ternary) | 2.125 | **495 MiB** | **44.2 tok/s** *(prefill 243 ms)* |
+| **Bonsai 4B** | Qwen3-4B | `Q1_0` (1-bit) | 1.125 | **546 MiB** | **30.7 tok/s** *(prefill 339 ms)* |
+| **Ternary Bonsai 4B** | Qwen3-4B | `PQ2_0` (Ternary) | 2.125 | **1,025 MiB** | **28.9 tok/s** *(prefill 451 ms)* |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PTQ1_0` (Ternary) | 1.750 | **902 MiB** | **13.3 tok/s** *(prefill 836 ms)* |
+| **Bonsai 2 4B** | Qwen3.5-4B | `PQ2_0` (Ternary) | 2.125 | **1,093 MiB** | **20.6 tok/s** *(prefill 446 ms)* |
+| **Bonsai 8B** | Qwen3-8B | `Q1_0` (1-bit) | 1.125 | **1,100 MiB** | **26.4 tok/s** *(prefill 478 ms)* |
+| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **522 MiB** | **33.9 tok/s** *(prefill 722 ms)* |
+| **PLaMo 3 Translate 0.8B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.5 | **546 MiB** | **31.0 tok/s** *(prefill 852 ms)* |
+| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_0` / `Q6_K` | ~4.3 | **1,620 MiB** | **12.7 tok/s** *(prefill 2695 ms)* |
+| **PLaMo 3 Translate 2B** | `plamo3` (SWA + YaRN) | `Q4_K_M` | ~4.6 | **1,723 MiB** | **10.9 tok/s** *(prefill 3139 ms)* |
 
 ### Published Quality Benchmarks
 

@@ -756,6 +756,8 @@
       messages = []
       engine?.resetCache()
       chatBox.innerHTML = ''
+      transOutputBox.textContent = ''
+      transStatsBox.textContent = ''
       statusText.textContent = 'KV & recurrent cache reset.'
     }
 
@@ -772,6 +774,9 @@
 
     loadBtn.onclick = async () => {
       const url = modelSelect.value
+      if (busy && abortCtrl) {
+        abortCtrl.abort()
+      }
       if (prefetchCtrl) {
         prefetchCtrl.abort()
         await prefetchPromise?.catch(() => {})
@@ -782,6 +787,8 @@
       modelSelect.disabled = true
       clearChatBtn.disabled = true
       runTransBtn.disabled = true
+      promptInput.disabled = true
+      sendBtn.disabled = true
       progWrap.style.display = 'block'
       progBar.style.width = '0%'
 
@@ -792,6 +799,8 @@
         }
         messages = []
         chatBox.innerHTML = ''
+        transOutputBox.textContent = ''
+        transStatsBox.textContent = ''
 
         engine = await HachiueEngine.create({
           url,
