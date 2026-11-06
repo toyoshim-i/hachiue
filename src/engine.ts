@@ -4,6 +4,8 @@ import { sampleLogits } from './sampler.js'
 import { prefetchModel, streamModelChunks } from './storage.js'
 import { GgufTokenizer } from './tokenizer.js'
 import {
+  type BackendInfo,
+  type BackendType,
   type ChatMessage,
   type EngineOptions,
   type GenerateOptions,
@@ -14,6 +16,7 @@ import {
   type ParsedGgufHeader,
   type StorageOptions,
 } from './types.js'
+import { createWasmBackend, type WasmBackend } from './wasm-backend.js'
 
 // WebGPU GPUBufferUsage numeric constants (safe to evaluate in Node.js before WebGPU exists)
 const MAP_READ = 0x0001
@@ -311,9 +314,13 @@ export class HachiueEngine {
   readonly header: ParsedGgufHeader
   readonly arch: ModelArch
   readonly tokenizer: GgufTokenizer | null
+  readonly backend: BackendType
+  readonly isWorker: boolean
+  readonly backendInfo: BackendInfo
   readonly device: GPUDevice
   readonly maxSeqLen: number
 
+  private readonly wasmBackend: WasmBackend | null
   private readonly pipelines: Map<string, GPUComputePipeline>
   private readonly weights: Map<string, GpuTensor>
   private readonly hadamardSigns: Map<number, GPUBuffer>
@@ -352,28 +359,56 @@ export class HachiueEngine {
 
   private constructor(
     header: ParsedGgufHeader,
-    device: GPUDevice,
+    device: GPUDevice | null,
     maxSeqLen: number,
     pipelines: Map<string, GPUComputePipeline>,
     weights: Map<string, GpuTensor>,
     hadamardSigns: Map<number, GPUBuffer>,
-    cosBuf: GPUBuffer,
-    sinBuf: GPUBuffer,
+    cosBuf: GPUBuffer | null,
+    sinBuf: GPUBuffer | null,
     swaCosBuf: GPUBuffer | null,
     swaSinBuf: GPUBuffer | null,
+    wasmBackend: WasmBackend | null = null,
+    backendInfo?: BackendInfo,
   ) {
     this.header = header
     this.arch = header.arch
     this.tokenizer = header.tokenizer ? new GgufTokenizer(header.tokenizer) : null
-    this.device = device
+    this.backend = wasmBackend ? 'wasm' : 'webgpu'
+    this.isWorker = wasmBackend ? wasmBackend.isWorker : false
+    this.backendInfo = backendInfo ?? {
+      backend: this.backend,
+      isWorker: this.isWorker,
+      label: this.backend === 'webgpu' ? 'WebGPU' : this.isWorker ? 'Wasm SIMD (Worker)' : 'Wasm SIMD',
+    }
+    this.device = device as GPUDevice
     this.maxSeqLen = maxSeqLen
+    this.wasmBackend = wasmBackend
     this.pipelines = pipelines
     this.weights = weights
     this.hadamardSigns = hadamardSigns
-    this.cosBuf = cosBuf
-    this.sinBuf = sinBuf
+    this.cosBuf = cosBuf as GPUBuffer
+    this.sinBuf = sinBuf as GPUBuffer
     this.swaCosBuf = swaCosBuf
     this.swaSinBuf = swaSinBuf
+
+    if (wasmBackend || !device) {
+      this.dummyBuf = null as unknown as GPUBuffer
+      this.logitsBuf = null as unknown as GPUBuffer
+      this.logitsReadBuf = null as unknown as GPUBuffer
+      this.logitsCpu = new Float32Array(0)
+      this.argmaxBuf = null as unknown as GPUBuffer
+      this.argmaxReadBuf = null as unknown as GPUBuffer
+      this.tokensBuf = null as unknown as GPUBuffer
+      this.scratch = null as unknown as ScratchBuffers
+      this.kCacheQ = new Map()
+      this.kCacheS = new Map()
+      this.vCacheQ = new Map()
+      this.vCacheS = new Map()
+      this.ssmConvState = new Map()
+      this.ssmRecState = new Map()
+      return
+    }
 
     const mkBuf = (size: number, usage = STORAGE_COPY): GPUBuffer =>
       device.createBuffer({ size: Math.max(16, (size + 3) & ~3), usage })
@@ -476,58 +511,136 @@ export class HachiueEngine {
 
   /**
    * Create and initialize a HachiueEngine from a GGUF URL.
+   * By default (`backend: 'auto'`), uses WebGPU when available and automatically falls back
+   * to the Wasm SIMD Web Worker backend when WebGPU is unsupported or adapter acquisition fails.
    */
   static async create(options: EngineOptions): Promise<HachiueEngine> {
     const maxSeqLen = options.maxSeqLen ?? 4096
     const header = await fetchGgufHeader(options.url, options)
     const arch = header.arch
+    const requestedBackend = options.backend ?? (options.device ? 'webgpu' : 'auto')
+
+    const { cos, sin } = buildRopeTables(arch, maxSeqLen, false)
+    let sCos: Float32Array | null = null
+    let sSin: Float32Array | null = null
+    if (arch.swa) {
+      const swaTables = buildRopeTables(arch, maxSeqLen, true)
+      sCos = swaTables.cos
+      sSin = swaTables.sin
+    }
+
+    const initWasmFallback = async (fallbackReason?: string): Promise<HachiueEngine> => {
+      const wasmBackend = await createWasmBackend(header, options, cos, sin, sCos, sSin)
+      const info: BackendInfo = {
+        backend: 'wasm',
+        isWorker: wasmBackend.isWorker,
+        label: wasmBackend.isWorker ? 'Wasm SIMD (Worker)' : 'Wasm SIMD',
+        ...(fallbackReason ? { fallbackReason } : {}),
+      }
+      return new HachiueEngine(
+        header,
+        null,
+        maxSeqLen,
+        new Map(),
+        new Map(),
+        new Map(),
+        null,
+        null,
+        null,
+        null,
+        wasmBackend,
+        info,
+      )
+    }
+
+    if (requestedBackend === 'wasm') {
+      return initWasmFallback()
+    }
 
     let device = options.device
-    if (!device) {
-      if (typeof navigator === 'undefined' || !navigator.gpu) {
-        throw new Error('hachiue: WebGPU is not supported in this browser')
+    let adapterMode: BackendInfo['adapterMode'] = device ? 'custom-device' : undefined
+    let pipelines: Map<string, GPUComputePipeline> | null = null
+
+    try {
+      if (!device) {
+        if (typeof navigator === 'undefined' || !navigator.gpu) {
+          throw new Error('hachiue: WebGPU is not supported in this browser')
+        }
+        let adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+        if (adapter) {
+          adapterMode = 'high-performance'
+        } else {
+          adapter = await navigator.gpu.requestAdapter()
+          if (adapter) {
+            adapterMode = 'default'
+          } else {
+            adapter = await navigator.gpu.requestAdapter({
+              featureLevel: 'compatibility',
+            } as GPURequestAdapterOptions)
+            if (adapter) adapterMode = 'compatibility'
+          }
+        }
+        if (!adapter) {
+          throw new Error('hachiue: Failed to acquire WebGPU adapter')
+        }
+        const maxBind = Math.min(adapter.limits.maxStorageBufferBindingSize, 256 * 1024 * 1024)
+        const maxBuf = Math.min(adapter.limits.maxBufferSize, 512 * 1024 * 1024)
+        const maxStoragePerStage = adapter.limits.maxStorageBuffersPerShaderStage
+        device = await adapter.requestDevice({
+          requiredLimits: {
+            maxStorageBufferBindingSize: maxBind,
+            maxBufferSize: maxBuf,
+            ...(maxStoragePerStage ? { maxStorageBuffersPerShaderStage: maxStoragePerStage } : {}),
+          },
+        })
       }
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-      if (!adapter) {
-        throw new Error('hachiue: Failed to acquire WebGPU adapter')
-      }
-      const maxBind = Math.min(adapter.limits.maxStorageBufferBindingSize, 256 * 1024 * 1024)
-      const maxBuf = Math.min(adapter.limits.maxBufferSize, 512 * 1024 * 1024)
-      device = await adapter.requestDevice({
-        requiredLimits: {
-          maxStorageBufferBindingSize: maxBind,
-          maxBufferSize: maxBuf,
-        },
+
+      options.onProgress?.({
+        phase: 'pipelines',
+        message: 'Compiling WebGPU shaders...',
+        backend: 'webgpu',
+        isWorker: false,
       })
+      pipelines = new Map<string, GPUComputePipeline>()
+      await Promise.all(
+        Object.entries(SHADERS).map(async ([name, code]) => {
+          const mod = device!.createShaderModule({ code, label: name })
+          if (typeof mod.getCompilationInfo === 'function') {
+            const info = await mod.getCompilationInfo()
+            const err = info.messages.find((m) => m.type === 'error')
+            if (err) {
+              throw new Error(`hachiue: WGSL error in ${name} (L${err.lineNum}:${err.linePos}): ${err.message}`)
+            }
+          }
+          try {
+            const pipe = await device!.createComputePipelineAsync({
+              layout: 'auto',
+              compute: { module: mod, entryPoint: 'main' },
+            })
+            pipelines!.set(name, pipe)
+          } catch (err) {
+            throw new Error(`hachiue: pipeline compile failed in ${name}: ${(err as Error).message || err}`)
+          }
+        }),
+      )
+    } catch (err) {
+      if (device && !options.device) {
+        try {
+          device.destroy()
+        } catch {
+          // ignore
+        }
+      }
+      if (requestedBackend === 'webgpu') {
+        throw err
+      }
+      const reason = err instanceof Error ? err.message : String(err)
+      return initWasmFallback(reason)
     }
 
     device.lost.then((info) => {
       options.onDeviceLost?.({ reason: String(info.reason ?? 'unknown'), message: info.message })
     })
-
-    options.onProgress?.({ phase: 'pipelines', message: 'Compiling WebGPU shaders...' })
-    const pipelines = new Map<string, GPUComputePipeline>()
-    await Promise.all(
-      Object.entries(SHADERS).map(async ([name, code]) => {
-        const mod = device!.createShaderModule({ code, label: name })
-        if (typeof mod.getCompilationInfo === 'function') {
-          const info = await mod.getCompilationInfo()
-          const err = info.messages.find((m) => m.type === 'error')
-          if (err) {
-            throw new Error(`hachiue: WGSL error in ${name} (L${err.lineNum}:${err.linePos}): ${err.message}`)
-          }
-        }
-        try {
-          const pipe = await device!.createComputePipelineAsync({
-            layout: 'auto',
-            compute: { module: mod, entryPoint: 'main' },
-          })
-          pipelines.set(name, pipe)
-        } catch (err) {
-          throw new Error(`hachiue: pipeline compile failed in ${name}: ${(err as Error).message || err}`)
-        }
-      }),
-    )
 
     // Upload Hadamard sign vectors if present
     const hadamardSigns = new Map<number, GPUBuffer>()
@@ -541,8 +654,7 @@ export class HachiueEngine {
       }
     }
 
-    // Build and upload RoPE tables
-    const { cos, sin } = buildRopeTables(arch, maxSeqLen, false)
+    // Upload RoPE tables
     const cosBuf = device.createBuffer({ size: cos.byteLength, usage: STORAGE_COPY })
     const sinBuf = device.createBuffer({ size: sin.byteLength, usage: STORAGE_COPY })
     device.queue.writeBuffer(cosBuf, 0, cos.buffer as ArrayBuffer, cos.byteOffset, cos.byteLength)
@@ -550,8 +662,7 @@ export class HachiueEngine {
 
     let swaCosBuf: GPUBuffer | null = null
     let swaSinBuf: GPUBuffer | null = null
-    if (arch.swa) {
-      const { cos: sCos, sin: sSin } = buildRopeTables(arch, maxSeqLen, true)
+    if (sCos && sSin) {
       swaCosBuf = device.createBuffer({ size: sCos.byteLength, usage: STORAGE_COPY })
       swaSinBuf = device.createBuffer({ size: sSin.byteLength, usage: STORAGE_COPY })
       device.queue.writeBuffer(swaCosBuf, 0, sCos.buffer as ArrayBuffer, sCos.byteOffset, sCos.byteLength)
@@ -753,7 +864,19 @@ export class HachiueEngine {
     )
 
     await device.queue.onSubmittedWorkDone()
-    options.onProgress?.({ phase: 'ready', message: 'Model loaded into WebGPU memory' })
+    options.onProgress?.({
+      phase: 'ready',
+      message: 'Model loaded into WebGPU memory',
+      backend: 'webgpu',
+      isWorker: false,
+    })
+
+    const info: BackendInfo = {
+      backend: 'webgpu',
+      isWorker: false,
+      label: adapterMode === 'compatibility' ? 'WebGPU (Compat)' : 'WebGPU',
+      adapterMode,
+    }
 
     return new HachiueEngine(
       header,
@@ -766,6 +889,8 @@ export class HachiueEngine {
       sinBuf,
       swaCosBuf,
       swaSinBuf,
+      null,
+      info,
     )
   }
 
@@ -778,28 +903,42 @@ export class HachiueEngine {
     this.tokenHistory = []
     this.lastMessages = []
     this.lastTurnTokens = []
+    if (this.wasmBackend) {
+      this.wasmBackend.resetCache()
+    }
   }
 
   /**
-   * Destroy all GPU buffers.
+   * Destroy all GPU or Wasm Worker resources.
    */
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
-    this.device.destroy()
+    if (this.wasmBackend) {
+      this.wasmBackend.dispose()
+    } else if (this.device) {
+      this.device.destroy()
+    }
   }
 
   /**
-   * Wait for all queued GPU buffer writes and compute work to finish.
+   * Wait for all queued GPU buffer writes or Wasm Worker operations to finish.
    */
   async flushDeviceQueue(): Promise<void> {
+    if (this.wasmBackend) {
+      await this.wasmBackend.flush()
+      return
+    }
     await this.device.queue.onSubmittedWorkDone()
   }
 
   /**
-   * Inspect a loaded weight tensor's dimensions and byte width per row in GPU memory.
+   * Inspect a loaded weight tensor's dimensions and byte width per row in GPU/Wasm memory.
    */
   getTensorRowSpec(name: string): { type: GgmlType; rows: number; cols: number; rowBytes: number } {
+    if (this.wasmBackend) {
+      return this.wasmBackend.getTensorRowSpec(name)
+    }
     const tensor = this.weights.get(name)
     if (!tensor) {
       throw new Error(`hachiue: tensor "${name}" not found`)
@@ -833,10 +972,13 @@ export class HachiueEngine {
   }
 
   /**
-   * Read one or more rows from a GPU weight tensor into a contiguous `Uint8Array(rowIndices.length * rowBytes)`.
+   * Read one or more rows from a GPU/Wasm weight tensor into a contiguous `Uint8Array(rowIndices.length * rowBytes)`.
    * Automatically resolves 64 MiB storage buffer chunk boundaries.
    */
   async readTensorRows(name: string, rowIndices: ArrayLike<number>): Promise<Uint8Array> {
+    if (this.wasmBackend) {
+      return this.wasmBackend.readTensorRows(name, rowIndices)
+    }
     const tensor = this.weights.get(name)
     if (!tensor) {
       throw new Error(`hachiue: tensor "${name}" not found`)
@@ -865,10 +1007,14 @@ export class HachiueEngine {
   }
 
   /**
-   * Overwrite one or more rows of a GPU weight tensor in-place via `device.queue.writeBuffer`.
+   * Overwrite one or more rows of a GPU/Wasm weight tensor in-place.
    * If `data.byteLength === rowBytes` and `rowIndices.length > 1`, the single row is broadcast to all `rowIndices`.
    */
   writeTensorRows(name: string, rowIndices: ArrayLike<number>, data: Uint8Array): void {
+    if (this.wasmBackend) {
+      this.wasmBackend.writeTensorRows(name, rowIndices, data)
+      return
+    }
     const tensor = this.weights.get(name)
     if (!tensor) {
       throw new Error(`hachiue: tensor "${name}" not found`)
@@ -1051,6 +1197,12 @@ export class HachiueEngine {
     if (S === 0) throw new Error('hachiue: empty tokenIds')
     if (this.cachePos + S > this.maxSeqLen) {
       throw new Error(`hachiue: context length ${this.cachePos + S} exceeds maxSeqLen ${this.maxSeqLen}`)
+    }
+
+    if (this.wasmBackend) {
+      const posBase = this.cachePos
+      this.cachePos += S
+      return this.wasmBackend.forwardSegment(tokenIds, computeLogits, greedyOnly, posBase)
     }
 
     const H = this.arch.heads
@@ -1514,6 +1666,8 @@ export class HachiueEngine {
         prefillTokensPerSec: (toPrefill.length / Math.max(1, prefillMs)) * 1000,
         decodeTokensPerSec: (generatedIds.length / decodeMs) * 1000,
         reusedCache: prefixMatch > 0,
+        backend: this.backend,
+        isWorker: this.isWorker,
       },
     }
   }

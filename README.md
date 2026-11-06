@@ -24,6 +24,9 @@ Zero-dependency, mobile-optimized WebGPU LLM & translation inference engine supp
   - Keeps both PrismML ultra-low-bit formats (`Q1_0`, `PTQ1_0`, `PQ2_0`) and standard GGML formats (`Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`) at their exact native GGUF footprint in GPU memory.
   - Shares `token_embd.weight` and `output.weight` (`lm_head`) GPU buffers when `tie_word_embeddings` is enabled, and automatically splits large tensors across `64 MiB` storage buffer chunks.
   - Reuses a single `1.125 MiB` CPU staging buffer pair during loading and a pre-allocated GPU scratch buffer pool during inference (**zero dynamic GPU/CPU buffer allocations per token**).
+- **Automatic WebAssembly SIMD (`v128`) + Web Worker Fallback**:
+  - On mid-range Android devices or environments where WebGPU is unavailable or blocked (e.g. Arm Mali GPUs without WebGPU adapter support), `HachiueEngine.create({ backend: 'auto' })` automatically falls back to a **zero-dependency inline Wasm SIMD (`v128`) backend running inside a self-contained Blob Web Worker**.
+  - Implements 4-row unrolled `i32x4.dot_i16x8_s` GEMV kernels across all 8 quantization formats (`F32`, `Q1_0`, `PQ2_0`, `PTQ1_0`, `Q4_0`, `Q4_1`, `Q4_K`, `Q6_K`) while keeping quantized weights un-inflated in `WebAssembly.Memory` off the main UI thread.
 - **Tier 2 Translation Helpers (`translateText` & `translateTerm`)**:
   - Absorbs prompt templates (PFML3 `<|plamo:tag|>` vs ChatML `<|im_start|>`), stop tokens, language code normalization, reasoning tag stripping, and target script validation across PLaMo 3 Translate and Bonsai 1 / 2.
 
@@ -96,10 +99,15 @@ import { HachiueEngine, prefetchModel } from 'hachiue';
 
 const engine = await HachiueEngine.create({
   url: 'https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/main/plamo-3-translate-0.8b-Q4_0.gguf',
+  backend: 'auto', // 'auto' (default) | 'webgpu' | 'wasm'
   onProgress: (p) => {
     if (p.totalBytes) console.log(`${p.phase}: ${(p.loadedBytes / 1048576).toFixed(1)} MiB`);
   },
 });
+
+console.log(engine.backendInfo);
+// -> { backend: 'webgpu', isWorker: false, label: 'WebGPU', adapterMode: 'high-performance' }
+// or { backend: 'wasm', isWorker: true, label: 'Wasm SIMD (Worker)', fallbackReason: '...' }
 
 const reply = await engine.generate(
   [{ role: 'user', content: 'Small trees thrive in small pots.' }],

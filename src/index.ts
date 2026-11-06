@@ -41,6 +41,8 @@ export {
   translateText,
 } from './translate.js'
 export type {
+  BackendInfo,
+  BackendType,
   ChatMessage,
   EngineOptions,
   GenerateOptions,
@@ -58,3 +60,18 @@ export type {
   TokenizerData,
 } from './types.js'
 export { GgmlType } from './types.js'
+export { createWasmBackend, createWasmCore, type WasmBackend } from './wasm-backend.js'
+export {
+  getWasmKernelModuleBytes,
+  WASM_MEM_CONSTS,
+  WASM_MEM_FP16_TABLE,
+  WASM_MEM_Q1_LUT,
+  WASM_MEM_WEIGHTS_BASE,
+  WASM_MEM_X_F32,
+  WASM_MEM_X_F32_SUM,
+  WASM_MEM_X_PQ2_Q16,
+  WASM_MEM_X_Q16,
+  WASM_MEM_X_SCALE,
+  WASM_MEM_Y_F32,
+  type WasmKernelExports,
+} from './wasm-kernels.js'

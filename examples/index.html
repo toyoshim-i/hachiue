@@ -77,6 +77,27 @@
       color: var(--fg);
       border-color: var(--muted);
     }
+    .backend-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--muted);
+    }
+    .backend-badge.webgpu {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+    .backend-badge.wasm {
+      color: #d97706;
+      border-color: #d97706;
+    }
     .controls {
       display: flex;
       flex-wrap: wrap;
@@ -367,7 +388,10 @@
 
   <div class="status-bar">
     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;">
-      <div id="statusText">Select a PLaMo 3 Translate or Bonsai model and tap "Load Model".</div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <span id="backendBadge" class="backend-badge" title="Active compute backend">Checking GPU...</span>
+        <span id="statusText">Select a PLaMo 3 Translate or Bonsai model and tap "Load Model".</span>
+      </div>
       <div id="storageRow" style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;">
         <span id="prefetchStatus" style="color:var(--accent);"></span>
         <span id="storageUsage"></span>
@@ -486,9 +510,31 @@
     const clearCacheBtn = document.getElementById('clearCacheBtn')
     const prefetchStatus = document.getElementById('prefetchStatus')
     const storageUsage = document.getElementById('storageUsage')
+    const backendBadge = document.getElementById('backendBadge')
     const statusText = document.getElementById('statusText')
     const progWrap = document.getElementById('progWrap')
     const progBar = document.getElementById('progBar')
+
+    function setBackendBadge(mode, label, title) {
+      backendBadge.className = `backend-badge ${mode}`
+      backendBadge.textContent = label
+      if (title) backendBadge.title = title
+    }
+
+    ;(async () => {
+      try {
+        if (typeof navigator !== 'undefined' && navigator.gpu) {
+          let adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
+          if (!adapter) adapter = await navigator.gpu.requestAdapter()
+          if (!adapter) adapter = await navigator.gpu.requestAdapter({ featureLevel: 'compatibility' })
+          if (adapter) {
+            setBackendBadge('webgpu', '⚡ WebGPU', 'WebGPU adapter available')
+            return
+          }
+        }
+      } catch {}
+      setBackendBadge('wasm', '🧩 Wasm SIMD (Worker)', 'WebGPU unavailable — using WebAssembly SIMD Worker fallback')
+    })()
 
     // Mode tabs
     const tabTranslate = document.getElementById('tabTranslate')
@@ -806,6 +852,12 @@
           url,
           maxSeqLen: 1024,
           onProgress: (p) => {
+            if (p.backend) {
+              setBackendBadge(
+                p.backend,
+                p.backend === 'webgpu' ? '⚡ WebGPU' : p.isWorker ? '🧩 Wasm SIMD (Worker)' : '🧩 Wasm SIMD',
+              )
+            }
             if (p.phase === 'weights' && p.totalBytes) {
               const pct = ((p.loadedBytes / p.totalBytes) * 100).toFixed(1)
               const mb = (p.loadedBytes / 1048576).toFixed(0)
@@ -819,7 +871,13 @@
         })
 
         progWrap.style.display = 'none'
-        statusText.textContent = `Ready: ${engine.arch.modelName} (${engine.arch.archName}, ${engine.arch.layers}L, vocab=${engine.arch.vocab})`
+        const info = engine.backendInfo
+        setBackendBadge(
+          info.backend,
+          info.backend === 'webgpu' ? `⚡ ${info.label}` : `🧩 ${info.label}`,
+          info.fallbackReason ? `Fallback reason: ${info.fallbackReason}` : `Running on ${info.label}`,
+        )
+        statusText.textContent = `Ready [${info.label}]: ${engine.arch.modelName} (${engine.arch.archName}, ${engine.arch.layers}L, vocab=${engine.arch.vocab})`
         promptInput.disabled = false
         sendBtn.disabled = false
         runTransBtn.disabled = false
@@ -899,7 +957,7 @@
         transOutputBox.textContent = res.translation
         const ctxNote = res.usedContext ? ' · context applied' : ''
         transStatsBox.textContent =
-          `${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
+          `[${engine.backendInfo.label}] ${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
           (res.stats.reusedCache ? ' · cache reused' : '') +
           ctxNote
       } catch (err) {
@@ -964,7 +1022,7 @@
         })
         messages.push({ role: 'assistant', content: res.text })
         statsDiv.textContent =
-          `${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
+          `[${engine.backendInfo.label}] ${res.stats.generatedTokens} tokens · ${res.stats.decodeTokensPerSec.toFixed(1)} tok/s · prefill ${res.stats.prefillMs.toFixed(0)} ms (${res.stats.promptTokens} tok)` +
           (res.stats.reusedCache ? ' · cache reused' : '')
       } catch (err) {
         if (err.name === 'AbortError') {

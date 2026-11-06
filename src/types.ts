@@ -137,6 +137,8 @@ export interface LoadProgress {
   totalBytes?: number
   cached?: boolean
   message?: string
+  backend?: BackendType
+  isWorker?: boolean
 }
 
 export interface StorageOptions {
@@ -156,6 +158,16 @@ export interface StorageOptions {
   signal?: AbortSignal
 }
 
+export type BackendType = 'webgpu' | 'wasm'
+
+export interface BackendInfo {
+  backend: BackendType
+  isWorker: boolean
+  label: string
+  adapterMode?: 'high-performance' | 'default' | 'compatibility' | 'custom-device'
+  fallbackReason?: string
+}
+
 export interface EngineOptions extends StorageOptions {
   /** URL to the .gguf model on Hugging Face or any HTTP Range-capable server */
   url: string
@@ -163,6 +175,10 @@ export interface EngineOptions extends StorageOptions {
   maxSeqLen?: number
   /** KV cache quantization mode (default: 'q8' for 4x memory savings) */
   kvCache?: 'q8' | 'f16' | 'f32'
+  /** Inference backend selection (default: 'auto' — uses WebGPU when available, falls back to Wasm SIMD Worker) */
+  backend?: 'auto' | 'webgpu' | 'wasm'
+  /** Whether to run the Wasm SIMD backend inside a dedicated Web Worker when available (default: true) */
+  useWorker?: boolean
   /** Optional existing GPUDevice */
   device?: GPUDevice
   onDeviceLost?: (info: { reason: string; message: string }) => void
@@ -188,6 +204,8 @@ export interface GenerateStats {
   prefillTokensPerSec: number
   decodeTokensPerSec: number
   reusedCache: boolean
+  backend: BackendType
+  isWorker: boolean
 }
 
 export interface ChatMessage {

@@ -11,10 +11,22 @@ import {
   fetchGgufHeader,
   fp16ToFp32,
   fwhtBlockCpu,
+  getWasmKernelModuleBytes,
   GgmlType,
   GgufTokenizer,
   isValidTargetLanguageTranslation,
   normalizeLangCode,
+  WASM_MEM_CONSTS,
+  WASM_MEM_FP16_TABLE,
+  WASM_MEM_Q1_LUT,
+  WASM_MEM_WEIGHTS_BASE,
+  WASM_MEM_X_F32,
+  WASM_MEM_X_F32_SUM,
+  WASM_MEM_X_PQ2_Q16,
+  WASM_MEM_X_Q16,
+  WASM_MEM_X_SCALE,
+  WASM_MEM_Y_F32,
+  type WasmKernelExports,
 } from '../src/index.js'
 
 describe('Quantization & Dequantization (Q1_0, PQ2_0, PTQ1_0)', () => {
@@ -301,5 +313,281 @@ describe('Tier 2 Translation Helpers (PFML3 & ChatML Builders, Cleansing, Valida
     assert.equal(docMsgs.length, 2)
     assert.ok(docMsgs[0].content.includes('だ・である調'))
     assert.ok(docMsgs[0].content.includes('"pots" -> "鉢"'))
+  })
+})
+
+describe('Wasm SIMD (v128) Kernel Compilation & Numerical Accuracy', () => {
+  it('compiles inline Wasm SIMD module and matches reference GEMV for F32, Q1_0, PQ2_0, PTQ1_0, Q4_0, Q4_1, Q4_K, Q6_K (including non-multiple-of-4 tail rows)', () => {
+    const wasmBytes = getWasmKernelModuleBytes()
+    assert.equal(WebAssembly.validate(wasmBytes as BufferSource), true, 'Generated Wasm SIMD binary must be valid')
+
+    const wasmMem = new WebAssembly.Memory({ initial: 128 }) // 8 MiB
+    const mod = new WebAssembly.Module(wasmBytes as BufferSource)
+    const inst = new WebAssembly.Instance(mod, { env: { memory: wasmMem } })
+    const kernels = inst.exports as unknown as WasmKernelExports
+
+    // Initialize FP16 table, Q1_0 LUT, and PTQ1_0 tail constants
+    const buf = wasmMem.buffer
+    const fp16Tab = new Float32Array(buf, WASM_MEM_FP16_TABLE, 65536)
+    for (let i = 0; i < 65536; i++) fp16Tab[i] = fp16ToFp32(i)
+
+    const q1Lut = new Int8Array(buf, WASM_MEM_Q1_LUT, 2048)
+    for (let b = 0; b < 256; b++) {
+      for (let bit = 0; bit < 8; bit++) {
+        q1Lut[b * 8 + bit] = (b >> bit) & 1 ? 1 : -1
+      }
+    }
+    new Int16Array(buf, WASM_MEM_CONSTS, 8).set([1, 1, 3, 3, 9, 9, 27, 27])
+
+    const xF32 = new Float32Array(buf, WASM_MEM_X_F32, 65536)
+    const xQ16 = new Int16Array(buf, WASM_MEM_X_Q16, 65536)
+    const xPq2Q16 = new Int16Array(buf, WASM_MEM_X_PQ2_Q16, 65536)
+    const xScale = new Float32Array(buf, WASM_MEM_X_SCALE, 4096)
+    const xF32Sum = new Float32Array(buf, WASM_MEM_X_F32_SUM, 4096)
+    const yF32 = new Float32Array(buf, WASM_MEM_Y_F32, 1024)
+
+    // Test with N = 7 (exercises 4-row unrolled loop for rows 0..3 and 1-row tail loop for rows 4..6)
+    const K = 512
+    const N = 7
+    const nb128 = K / 128
+    const nb32 = K / 32
+    const nb256 = K / 256
+
+    const x = new Float32Array(K)
+    for (let i = 0; i < K; i++) x[i] = Math.sin(i * 0.17) * 0.8
+    xF32.set(x, 0)
+
+    const quantize128 = () => {
+      for (let b = 0; b < nb128; b++) {
+        const base = b * 128
+        let amax = 0
+        for (let i = 0; i < 128; i++) amax = Math.max(amax, Math.abs(x[base + i]))
+        const sc = amax / 16384.0
+        const inv = amax > 0 ? 16384.0 / amax : 0
+        xScale[b] = sc
+        for (let i = 0; i < 128; i++) xQ16[base + i] = Math.round(x[base + i] * inv)
+        for (let sub = 0; sub < 4; sub++) {
+          const sb = base + sub * 32
+          for (let m = 0; m < 8; m++) {
+            xPq2Q16[sb + m] = xQ16[sb + m * 4 + 0]
+            xPq2Q16[sb + 8 + m] = xQ16[sb + m * 4 + 1]
+            xPq2Q16[sb + 16 + m] = xQ16[sb + m * 4 + 2]
+            xPq2Q16[sb + 24 + m] = xQ16[sb + m * 4 + 3]
+          }
+        }
+      }
+    }
+
+    const quantize32 = () => {
+      for (let b = 0; b < nb32; b++) {
+        const base = b * 32
+        let amax = 0
+        let fsum = 0
+        for (let i = 0; i < 32; i++) {
+          fsum += x[base + i]
+          amax = Math.max(amax, Math.abs(x[base + i]))
+        }
+        const sc = amax / 16384.0
+        const inv = amax > 0 ? 16384.0 / amax : 0
+        xScale[b] = sc
+        xF32Sum[b] = fsum
+        for (let i = 0; i < 32; i++) xQ16[base + i] = Math.round(x[base + i] * inv)
+      }
+    }
+
+    // 1. F32
+    const wF32 = new Float32Array(buf, WASM_MEM_WEIGHTS_BASE, N * K)
+    const expF32 = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let k = 0; k < K; k++) {
+        const wv = Math.cos((r * K + k) * 0.11) * 0.5
+        wF32[r * K + k] = wv
+        s += x[k] * wv
+      }
+      expF32[r] = s
+    }
+    kernels.gemv_f32(1, N, K, WASM_MEM_WEIGHTS_BASE, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expF32[r]) < 1e-4, `Wasm F32 row ${r}: ${yF32[r]} vs ${expF32[r]}`)
+    }
+
+    // 2. Q1_0
+    quantize128()
+    const q1Quants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb128 * 16)
+    const q1Scales = new Uint16Array(buf, WASM_MEM_WEIGHTS_BASE + 4096, N * nb128)
+    const expQ1 = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb128; b++) {
+        const blkIdx = r * nb128 + b
+        q1Scales[blkIdx] = 0x3800 // 0.5
+        const rawBlock = new Uint8Array(18)
+        rawBlock[0] = 0x00
+        rawBlock[1] = 0x38
+        for (let i = 0; i < 16; i++) {
+          const byte = (r * 31 + b * 17 + i * 13) & 0xff
+          q1Quants[blkIdx * 16 + i] = byte
+          rawBlock[2 + i] = byte
+        }
+        const deq = new Float32Array(128)
+        dequantizeBlock128Cpu(rawBlock, GgmlType.Q1_0, deq)
+        for (let j = 0; j < 128; j++) s += x[b * 128 + j] * deq[j]
+      }
+      expQ1[r] = s
+    }
+    kernels.gemv_q1_0(1, N, K, nb128, WASM_MEM_WEIGHTS_BASE, WASM_MEM_WEIGHTS_BASE + 4096, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expQ1[r]) < 2e-3, `Wasm Q1_0 row ${r}: ${yF32[r]} vs ${expQ1[r]}`)
+    }
+
+    // 3. PQ2_0
+    const pq2Quants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb128 * 32)
+    const pq2Scales = new Uint16Array(buf, WASM_MEM_WEIGHTS_BASE + 4096, N * nb128)
+    const expPq2 = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb128; b++) {
+        const blkIdx = r * nb128 + b
+        pq2Scales[blkIdx] = 0x3c00 // 1.0
+        const rawBlock = new Uint8Array(34)
+        rawBlock[0] = 0x00
+        rawBlock[1] = 0x3c
+        for (let i = 0; i < 32; i++) {
+          const t0 = (r + b + i) % 3
+          const t1 = (r + b + i + 1) % 3
+          const t2 = (r + b + i + 2) % 3
+          const t3 = (r + b + i + 3) % 3
+          const byte = t0 | (t1 << 2) | (t2 << 4) | (t3 << 6)
+          pq2Quants[blkIdx * 32 + i] = byte
+          rawBlock[2 + i] = byte
+        }
+        const deq = new Float32Array(128)
+        dequantizeBlock128Cpu(rawBlock, GgmlType.PQ2_0, deq)
+        for (let j = 0; j < 128; j++) s += x[b * 128 + j] * deq[j]
+      }
+      expPq2[r] = s
+    }
+    kernels.gemv_pq2_0(1, N, K, nb128, WASM_MEM_WEIGHTS_BASE, WASM_MEM_WEIGHTS_BASE + 4096, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expPq2[r]) < 2e-3, `Wasm PQ2_0 row ${r}: ${yF32[r]} vs ${expPq2[r]}`)
+    }
+
+    // 4. PTQ1_0
+    const ptqQuants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb128 * 26)
+    const ptqScales = new Uint16Array(buf, WASM_MEM_WEIGHTS_BASE + 4096, N * nb128)
+    const expPtq = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb128; b++) {
+        const blkIdx = r * nb128 + b
+        ptqScales[blkIdx] = 0x3c00
+        const rawBlock = new Uint8Array(28)
+        rawBlock[26] = 0x00
+        rawBlock[27] = 0x3c
+        for (let i = 0; i < 26; i++) {
+          const byte = ((r * 19 + b * 23 + i * 41) % 240) & 0xff
+          ptqQuants[blkIdx * 26 + i] = byte
+          rawBlock[i] = byte
+        }
+        const deq = new Float32Array(128)
+        dequantizeBlock128Cpu(rawBlock, GgmlType.PTQ1_0, deq)
+        for (let j = 0; j < 128; j++) s += x[b * 128 + j] * deq[j]
+      }
+      expPtq[r] = s
+    }
+    kernels.gemv_ptq1_0(1, N, K, nb128, WASM_MEM_WEIGHTS_BASE, WASM_MEM_WEIGHTS_BASE + 4096, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expPtq[r]) < 2e-3, `Wasm PTQ1_0 row ${r}: ${yF32[r]} vs ${expPtq[r]}`)
+    }
+
+    // 5. Q4_0
+    quantize32()
+    const q40Quants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb32 * 18)
+    const expQ40 = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb32; b++) {
+        const blkOff = (r * nb32 + b) * 18
+        q40Quants[blkOff] = 0x00
+        q40Quants[blkOff + 1] = 0x38 // 0.5
+        for (let i = 0; i < 16; i++) q40Quants[blkOff + 2 + i] = (r * 29 + b * 17 + i * 7) & 0xff
+        const deq = new Float32Array(32)
+        dequantizeBlockCpu(q40Quants.subarray(blkOff, blkOff + 18), GgmlType.Q4_0, deq)
+        for (let j = 0; j < 32; j++) s += x[b * 32 + j] * deq[j]
+      }
+      expQ40[r] = s
+    }
+    kernels.gemv_q4_0(1, N, K, nb32, WASM_MEM_WEIGHTS_BASE, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expQ40[r]) < 1e-2, `Wasm Q4_0 row ${r}: ${yF32[r]} vs ${expQ40[r]}`)
+    }
+
+    // 6. Q4_1
+    const q41Quants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb32 * 20)
+    const expQ41 = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb32; b++) {
+        const blkOff = (r * nb32 + b) * 20
+        q41Quants[blkOff] = 0x00
+        q41Quants[blkOff + 1] = 0x34 // 0.25
+        q41Quants[blkOff + 2] = 0x00
+        q41Quants[blkOff + 3] = 0xb8 // -0.5
+        for (let i = 0; i < 16; i++) q41Quants[blkOff + 4 + i] = (r * 37 + b * 19 + i * 11) & 0xff
+        const deq = new Float32Array(32)
+        dequantizeBlockCpu(q41Quants.subarray(blkOff, blkOff + 20), GgmlType.Q4_1, deq)
+        for (let j = 0; j < 32; j++) s += x[b * 32 + j] * deq[j]
+      }
+      expQ41[r] = s
+    }
+    kernels.gemv_q4_1(1, N, K, nb32, WASM_MEM_WEIGHTS_BASE, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expQ41[r]) < 1e-2, `Wasm Q4_1 row ${r}: ${yF32[r]} vs ${expQ41[r]}`)
+    }
+
+    // 7. Q4_K
+    const q4kQuants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb256 * 144)
+    const expQ4k = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb256; b++) {
+        const blkOff = (r * nb256 + b) * 144
+        q4kQuants[blkOff] = 0x00
+        q4kQuants[blkOff + 1] = 0x30 // 0.125
+        q4kQuants[blkOff + 2] = 0x00
+        q4kQuants[blkOff + 3] = 0x2c // 0.0625
+        for (let i = 4; i < 144; i++) q4kQuants[blkOff + i] = (r * 41 + b * 23 + i * 13) & 0xff
+        const deq = new Float32Array(256)
+        dequantizeBlockCpu(q4kQuants.subarray(blkOff, blkOff + 144), GgmlType.Q4_K, deq)
+        for (let j = 0; j < 256; j++) s += x[b * 256 + j] * deq[j]
+      }
+      expQ4k[r] = s
+    }
+    kernels.gemv_q4_k(1, N, K, nb256, WASM_MEM_WEIGHTS_BASE, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expQ4k[r]) < 5e-2, `Wasm Q4_K row ${r}: ${yF32[r]} vs ${expQ4k[r]}`)
+    }
+
+    // 8. Q6_K
+    const q6kQuants = new Uint8Array(buf, WASM_MEM_WEIGHTS_BASE, N * nb256 * 210)
+    const expQ6k = new Float32Array(N)
+    for (let r = 0; r < N; r++) {
+      let s = 0
+      for (let b = 0; b < nb256; b++) {
+        const blkOff = (r * nb256 + b) * 210
+        for (let i = 0; i < 208; i++) q6kQuants[blkOff + i] = (r * 43 + b * 29 + i * 17) & 0xff
+        q6kQuants[blkOff + 208] = 0x00
+        q6kQuants[blkOff + 209] = 0x2c // 0.0625
+        const deq = new Float32Array(256)
+        dequantizeBlockCpu(q6kQuants.subarray(blkOff, blkOff + 210), GgmlType.Q6_K, deq)
+        for (let j = 0; j < 256; j++) s += x[b * 256 + j] * deq[j]
+      }
+      expQ6k[r] = s
+    }
+    kernels.gemv_q6_k(1, N, K, nb256, WASM_MEM_WEIGHTS_BASE, 0, 0, N)
+    for (let r = 0; r < N; r++) {
+      assert.ok(Math.abs(yF32[r] - expQ6k[r]) < 5e-2, `Wasm Q6_K row ${r}: ${yF32[r]} vs ${expQ6k[r]}`)
+    }
   })
 })

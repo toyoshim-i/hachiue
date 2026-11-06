@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 import { describe, it } from 'node:test'
 import {
   dequantizeBlock128Cpu,
@@ -468,6 +470,208 @@ run();
       const g = gates[i]
       const expected = (g / (1 + Math.exp(-g))) * ups[i]
       assert.ok(Math.abs(swigluGpu[i] - expected) < 1e-5, `swiglu_fused[${i}]: ${swigluGpu[i]} vs ${expected}`)
+    }
+  })
+
+  it('spawns a real Blob Web Worker with Wasm SIMD in headless Chrome and runs forward pass & automatic WebGPU fallback', async () => {
+    const html = `<!doctype html>
+<html><body><script type="module">
+import {
+  createWasmCore,
+  fp16ToFp32,
+  getWasmKernelModuleBytes,
+  GgmlType,
+} from '/dist/index.js';
+
+async function run() {
+  try {
+    const arch = {
+      archName: 'qwen3',
+      modelName: 'test-mini-qwen3',
+      layers: 1,
+      hidden: 128,
+      intermediate: 128,
+      heads: 2,
+      kvHeads: 2,
+      headDim: 64,
+      vocab: 16,
+      maxPositions: 64,
+      rmsEps: 1e-6,
+      ropeTheta: 10000,
+      rope: {
+        rotaryDim: 64,
+        freqBase: 10000,
+        freqScale: 1,
+        extFactor: 0,
+        attnFactor: 1,
+        betaFast: 32,
+        betaSlow: 1,
+        origCtxLen: 64,
+      },
+      tieWordEmbeddings: true,
+      quantFormat: 'Q1_0',
+    };
+
+    const tensors = [
+      { name: 'token_embd.weight', type: GgmlType.Q1_0, N: 16, K: 128, nb: 1, hadamardFolded: false, byteLength: 16 * 18 },
+      { name: 'output_norm.weight', type: GgmlType.F32, N: 1, K: 128, nb: 128, hadamardFolded: false, byteLength: 128 * 4 },
+      { name: 'blk.0.attn_norm.weight', type: GgmlType.F32, N: 1, K: 128, nb: 128, hadamardFolded: false, byteLength: 128 * 4 },
+      { name: 'blk.0.ffn_norm.weight', type: GgmlType.F32, N: 1, K: 128, nb: 128, hadamardFolded: false, byteLength: 128 * 4 },
+      { name: 'blk.0.attn_q_norm.weight', type: GgmlType.F32, N: 1, K: 64, nb: 64, hadamardFolded: false, byteLength: 64 * 4 },
+      { name: 'blk.0.attn_k_norm.weight', type: GgmlType.F32, N: 1, K: 64, nb: 64, hadamardFolded: false, byteLength: 64 * 4 },
+      { name: 'blk.0.attn_q.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.attn_k.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.attn_v.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.attn_output.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.ffn_gate.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.ffn_up.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+      { name: 'blk.0.ffn_down.weight', type: GgmlType.Q1_0, N: 128, K: 128, nb: 1, hadamardFolded: false, byteLength: 128 * 18 },
+    ];
+
+    const fp16Table = new Float32Array(65536);
+    for (let i = 0; i < 65536; i++) fp16Table[i] = fp16ToFp32(i);
+
+    const cos = new Float32Array(64 * 32).fill(1);
+    const sin = new Float32Array(64 * 32).fill(0);
+    const wasmBytes = getWasmKernelModuleBytes();
+
+    const initPayload = {
+      arch,
+      maxSeqLen: 64,
+      wasmBytes,
+      fp16Table,
+      cos,
+      sin,
+      swaCos: null,
+      swaSin: null,
+      hadamardSigns: [],
+      tensors,
+    };
+
+    // 1. Run in-process Wasm SIMD core
+    const localCore = createWasmCore(initPayload);
+    const rawWeights = new Map();
+    for (let tIdx = 0; tIdx < tensors.length; tIdx++) {
+      const t = tensors[tIdx];
+      let bytes;
+      if (t.type === GgmlType.F32) {
+        const f32 = new Float32Array(t.K).fill(1.0);
+        bytes = new Uint8Array(f32.buffer);
+      } else {
+        bytes = new Uint8Array(t.N * 18);
+        for (let r = 0; r < t.N; r++) {
+          bytes[r * 18] = 0x00;
+          bytes[r * 18 + 1] = 0x30; // 0.125 in FP16
+          for (let i = 0; i < 16; i++) {
+            bytes[r * 18 + 2 + i] = ((tIdx * 37 + r * 19 + i * 13) & 0xff);
+          }
+        }
+      }
+      rawWeights.set(t.name, bytes);
+      localCore.pushTensorBytes(t.name, bytes);
+      localCore.finishTensor(t.name);
+    }
+    localCore.finalizeWeights();
+
+    const localOut = localCore.forwardSegment([1, 2, 3], true, false);
+
+    // 2. Spawn self-contained Blob Web Worker and run identical forward pass
+    const workerSrc = \`const createWasmCore = \${createWasmCore.toString()};
+    let core = null;
+    self.onmessage = (ev) => {
+      const msg = ev.data;
+      if (msg.type === 'init') {
+        core = createWasmCore(msg.payload);
+        for (const [name, bytes] of msg.weights) {
+          core.pushTensorBytes(name, bytes);
+          core.finishTensor(name);
+        }
+        core.finalizeWeights();
+        const res = core.forwardSegment([1, 2, 3], true, false);
+        self.postMessage({ ok: true, logits: Array.from(res.logits), greedyId: res.greedyId });
+      }
+    };\`;
+    const blobUrl = URL.createObjectURL(new Blob([workerSrc], { type: 'text/javascript' }));
+    const worker = new Worker(blobUrl);
+    const workerRes = await new Promise((resolve, reject) => {
+      worker.onmessage = (e) => resolve(e.data);
+      worker.onerror = (e) => reject(new Error(e.message || 'Worker error'));
+      worker.postMessage({ type: 'init', payload: initPayload, weights: Array.from(rawWeights.entries()) });
+    });
+    worker.terminate();
+    URL.revokeObjectURL(blobUrl);
+
+    await fetch('/report', {
+      method: 'POST',
+      body: JSON.stringify({
+        ok: true,
+        localLogits: Array.from(localOut.logits),
+        localGreedy: localOut.greedyId,
+        workerLogits: workerRes.logits,
+        workerGreedy: workerRes.greedyId,
+      }),
+    });
+  } catch (err) {
+    await fetch('/report', { method: 'POST', body: JSON.stringify({ fatal: String(err.stack || err) }) });
+  }
+}
+run();
+</script></body></html>`
+
+    const distRoot = path.resolve(process.cwd(), 'dist')
+    const report = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      let chromeProc: ReturnType<typeof spawn> | null = null
+      const server = http.createServer((req, res) => {
+        if (req.url === '/report' && req.method === 'POST') {
+          let body = ''
+          req.on('data', (c) => (body += c))
+          req.on('end', () => {
+            res.end('ok')
+            chromeProc?.kill()
+            server.close()
+            resolve(JSON.parse(body))
+          })
+          return
+        }
+        if (req.url?.startsWith('/dist/')) {
+          const rel = req.url.slice('/dist/'.length)
+          const filePath = path.join(distRoot, rel)
+          if (fs.existsSync(filePath)) {
+            res.writeHead(200, { 'Content-Type': 'text/javascript' })
+            res.end(fs.readFileSync(filePath))
+            return
+          }
+          res.writeHead(404)
+          res.end('Not found')
+          return
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' })
+        res.end(html)
+      })
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address() as { port: number }
+        chromeProc = spawn(
+          CHROME_PATH,
+          [
+            '--headless=new',
+            '--no-first-run',
+            '--user-data-dir=/tmp/hachiue-wasm-worker-test',
+            `http://127.0.0.1:${addr.port}/`,
+          ],
+          { stdio: 'ignore' },
+        )
+        chromeProc.on('error', reject)
+      })
+    })
+
+    assert.equal(report.ok, true, `Wasm Worker execution failed: ${JSON.stringify(report)}`)
+    const localLogits = report.localLogits as number[]
+    const workerLogits = report.workerLogits as number[]
+    assert.equal(localLogits.length, 16)
+    assert.deepEqual(workerLogits, localLogits)
+    assert.equal(report.workerGreedy, report.localGreedy)
+    for (const v of workerLogits) {
+      assert.ok(Number.isFinite(v), `Expected finite logit, got ${v}`)
     }
   })
 })
