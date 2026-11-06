@@ -1,6 +1,6 @@
 {
   "name": "hachiue",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Zero-dependency, mobile-optimized WebGPU LLM & translation inference engine for Bonsai 1/2 (1-bit/Ternary) and PLaMo 3 Translate (Q4_0/Q4_K/Q6_K) GGUF models",
   "type": "module",
   "main": "./dist/index.js",
