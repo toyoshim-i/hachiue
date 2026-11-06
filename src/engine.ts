@@ -789,6 +789,108 @@ export class HachiueEngine {
     this.device.destroy()
   }
 
+  /**
+   * Wait for all queued GPU buffer writes and compute work to finish.
+   */
+  async flushDeviceQueue(): Promise<void> {
+    await this.device.queue.onSubmittedWorkDone()
+  }
+
+  /**
+   * Inspect a loaded weight tensor's dimensions and byte width per row in GPU memory.
+   */
+  getTensorRowSpec(name: string): { type: GgmlType; rows: number; cols: number; rowBytes: number } {
+    const tensor = this.weights.get(name)
+    if (!tensor) {
+      throw new Error(`hachiue: tensor "${name}" not found`)
+    }
+    if (tensor.f32Buf) {
+      return { type: tensor.type, rows: tensor.N, cols: tensor.K, rowBytes: tensor.K * 4 }
+    }
+    if (tensor.type === GgmlType.Q1_0 || tensor.type === GgmlType.PQ2_0 || tensor.type === GgmlType.PTQ1_0) {
+      const qBytesPerBlock = tensor.type === GgmlType.Q1_0 ? 16 : tensor.type === GgmlType.PQ2_0 ? 32 : 26
+      return { type: tensor.type, rows: tensor.N, cols: tensor.K, rowBytes: tensor.nb * qBytesPerBlock }
+    }
+    const [, blkBytes] = getBlockSpec(tensor.type)
+    return { type: tensor.type, rows: tensor.N, cols: tensor.K, rowBytes: tensor.nb * blkBytes }
+  }
+
+  private resolveTensorRowBuffer(name: string, tensor: GpuTensor, rowIndex: number): { buf: GPUBuffer; localRow: number } {
+    if (rowIndex < 0 || rowIndex >= tensor.N) {
+      throw new Error(`hachiue: row index ${rowIndex} out of bounds for "${name}" (rows=${tensor.N})`)
+    }
+    if (tensor.f32Buf) {
+      return { buf: tensor.f32Buf, localRow: rowIndex }
+    }
+    if (tensor.chunks) {
+      for (const c of tensor.chunks) {
+        if (rowIndex >= c.rowStart && rowIndex < c.rowStart + c.rowCount) {
+          return { buf: c.quants, localRow: rowIndex - c.rowStart }
+        }
+      }
+    }
+    throw new Error(`hachiue: failed to resolve GPU chunk for "${name}" row ${rowIndex}`)
+  }
+
+  /**
+   * Read one or more rows from a GPU weight tensor into a contiguous `Uint8Array(rowIndices.length * rowBytes)`.
+   * Automatically resolves 64 MiB storage buffer chunk boundaries.
+   */
+  async readTensorRows(name: string, rowIndices: ArrayLike<number>): Promise<Uint8Array> {
+    const tensor = this.weights.get(name)
+    if (!tensor) {
+      throw new Error(`hachiue: tensor "${name}" not found`)
+    }
+    const { rowBytes } = this.getTensorRowSpec(name)
+    const count = rowIndices.length
+    if (count === 0) return new Uint8Array(0)
+
+    const totalBytes = count * rowBytes
+    const staging = this.device.createBuffer({
+      size: totalBytes,
+      usage: MAP_READ | COPY_DST,
+    })
+
+    const enc = this.device.createCommandEncoder()
+    for (let i = 0; i < count; i++) {
+      const { buf, localRow } = this.resolveTensorRowBuffer(name, tensor, rowIndices[i])
+      enc.copyBufferToBuffer(buf, localRow * rowBytes, staging, i * rowBytes, rowBytes)
+    }
+    this.device.queue.submit([enc.finish()])
+    await staging.mapAsync(MAP_READ)
+    const out = new Uint8Array(staging.getMappedRange().slice(0))
+    staging.unmap()
+    staging.destroy()
+    return out
+  }
+
+  /**
+   * Overwrite one or more rows of a GPU weight tensor in-place via `device.queue.writeBuffer`.
+   * If `data.byteLength === rowBytes` and `rowIndices.length > 1`, the single row is broadcast to all `rowIndices`.
+   */
+  writeTensorRows(name: string, rowIndices: ArrayLike<number>, data: Uint8Array): void {
+    const tensor = this.weights.get(name)
+    if (!tensor) {
+      throw new Error(`hachiue: tensor "${name}" not found`)
+    }
+    const { rowBytes } = this.getTensorRowSpec(name)
+    const count = rowIndices.length
+    if (count === 0) return
+
+    const broadcast = data.byteLength === rowBytes && count > 1
+    if (!broadcast && data.byteLength !== count * rowBytes) {
+      throw new Error(
+        `hachiue: writeTensorRows("${name}") expected ${count * rowBytes} (or ${rowBytes}) bytes, got ${data.byteLength}`,
+      )
+    }
+
+    for (let i = 0; i < count; i++) {
+      const { buf, localRow } = this.resolveTensorRowBuffer(name, tensor, rowIndices[i])
+      const srcOffset = broadcast ? data.byteOffset : data.byteOffset + i * rowBytes
+      this.device.queue.writeBuffer(buf, localRow * rowBytes, data.buffer as ArrayBuffer, srcOffset, rowBytes)
+    }
+  }
+
   private mkUniform(words: Array<number>, floatIndices: Set<number> = new Set()): GPUBuffer {
     for (let i = 0; i < 8; i++) {
       const val = i < words.length ? words[i] : 0
