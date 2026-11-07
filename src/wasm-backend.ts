@@ -1275,7 +1275,7 @@ export function createWasmCore(init: WasmCoreInitPayload) {
 /**
  * Self-contained Web Worker entry point.
  */
-function wasmWorkerEntrypoint(): void {
+function wasmWorkerEntrypoint(createCore = createWasmCore): void {
   let core: ReturnType<typeof createWasmCore> | null = null
   const g = self as unknown as {
     onmessage: ((ev: MessageEvent) => void) | null
@@ -1287,7 +1287,7 @@ function wasmWorkerEntrypoint(): void {
     try {
       switch (msg.type) {
         case 'init':
-          core = createWasmCore(msg.payload)
+          core = createCore(msg.payload)
           g.postMessage({ id: msg.id, ok: true })
           break
         case 'pushBatch':
@@ -1434,7 +1434,7 @@ export async function createWasmBackend(
 
   if (canUseWorker) {
     try {
-      const src = `const createWasmCore = ${createWasmCore.toString()};\n(${wasmWorkerEntrypoint.toString()})();`
+      const src = `(${wasmWorkerEntrypoint.toString()})(${createWasmCore.toString()});`
       const blob = new Blob([src], { type: 'text/javascript' })
       workerBlobUrl = URL.createObjectURL(blob)
       worker = new Worker(workerBlobUrl)
